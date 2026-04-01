@@ -52,8 +52,13 @@
               "images/disk-images"
             ]
           },
+        ]
+      },
+      {
+        "tab": "Cookbook",
+        "groups": [
           {
-            "group": "Cookbook",
+            "group": "Recipes",
             "icon": "book-open",
             "pages": [
               "cookbook/local-images"
