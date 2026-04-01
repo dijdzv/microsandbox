@@ -1,0 +1,62 @@
+---
+title: Using Local Docker Images
+description: Use locally built Docker images with microsandbox via a local registry
+icon: "docker"
+---
+
+microsandbox pulls images from OCI-compatible registries. If you build an image locally with `docker build`, microsandbox can't access it directly from Docker's local store. The workaround is to run a local registry and push your image there.
+
+## Step 1: Start a local registry
+
+Run a local OCI registry on port 5000:
+
+```bash
+docker run -d -p 5000:5000 --name registry registry:2
+```
+
+## Step 2: Build and tag your image
+
+Build your Docker image and tag it for the local registry:
+
+```bash
+docker build -t localhost:5000/my-image:latest .
+```
+
+If you already have an existing image, re-tag it:
+
+```bash
+docker tag my-image:latest localhost:5000/my-image:latest
+```
+
+## Step 3: Push to the local registry
+
+```bash
+docker push localhost:5000/my-image:latest
+```
+
+## Step 4: Use it in microsandbox
+
+Point microsandbox at your local registry image:
+
+<CodeGroup>
+```rust Rust
+let sb = Sandbox::builder("worker")
+    .image("localhost:5000/my-image:latest")
+    .create()
+    .await?;
+```
+
+```typescript TypeScript
+const sb = await Sandbox.create({
+    name: "worker",
+    image: "localhost:5000/my-image:latest",
+})
+```
+</CodeGroup>
+
+<Tip>
+  To persist registry data across container restarts, use a volume mount:
+  ```bash
+  docker run -d -p 5000:5000 -v registry-data:/var/lib/registry --name registry registry:2
+  ```
+</Tip>

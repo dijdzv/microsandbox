@@ -51,6 +51,13 @@
               "images/overview",
               "images/disk-images"
             ]
+          },
+          {
+            "group": "Cookbook",
+            "icon": "book-open",
+            "pages": [
+              "cookbook/local-images"
+            ]
           }
         ]
       },
