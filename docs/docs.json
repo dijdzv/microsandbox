@@ -55,18 +55,6 @@
         ]
       },
       {
-        "tab": "Cookbook",
-        "groups": [
-          {
-            "group": "Recipes",
-            "icon": "book-open",
-            "pages": [
-              "cookbook/local-images"
-            ]
-          }
-        ]
-      },
-      {
         "tab": "SDK Reference",
         "groups": [
           {
@@ -117,6 +105,18 @@
               "cli/sandbox-commands",
               "cli/volume-commands",
               "cli/image-commands"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Recipes",
+        "groups": [
+          {
+            "group": "Recipes",
+            "icon": "book-open",
+            "pages": [
+              "cookbook/local-images"
             ]
           }
         ]
