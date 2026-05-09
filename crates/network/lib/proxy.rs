@@ -112,8 +112,13 @@ async fn tcp_proxy_task(
             EgressEvaluation::Allow => {}
             EgressEvaluation::Deny => {
                 tracing::debug!(
-                    dst = %guest_dst,
+                    target: "policy_deny",
+                    transport = "tcp",
+                    host = sni.as_deref().unwrap_or(""),
+                    ip = %guest_dst.ip(),
+                    port = guest_dst.port(),
                     source = source.label(),
+                    sandbox_id = shared.sandbox_id().unwrap_or(""),
                     "TCP egress denied by domain policy",
                 );
                 return Ok(());
