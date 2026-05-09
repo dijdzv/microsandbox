@@ -147,8 +147,12 @@ pub(crate) async fn tls_proxy_task(
     );
     if !matches!(eval, EgressEvaluation::Allow) {
         tracing::debug!(
-            sni = %sni_name,
-            dst = %guest_dst,
+            target: "policy_deny",
+            transport = "tls",
+            host = %sni_name,
+            ip = %guest_dst.ip(),
+            port = guest_dst.port(),
+            sandbox_id = shared.sandbox_id().unwrap_or(""),
             "TLS egress denied by domain policy",
         );
         proxy_connect.mark_policy_denied();

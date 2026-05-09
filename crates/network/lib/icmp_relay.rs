@@ -174,7 +174,13 @@ impl IcmpRelay {
             .evaluate_egress_ip(IpAddr::V4(dst_ip), Protocol::Icmpv4, &self.shared)
             .is_deny()
         {
-            tracing::debug!(dst = %dst_ip, "ICMP echo denied by policy");
+            tracing::debug!(
+                target: "policy_deny",
+                transport = "icmpv4",
+                ip = %dst_ip,
+                sandbox_id = self.shared.sandbox_id().unwrap_or(""),
+                "ICMP echo denied by policy",
+            );
             return true; // Consumed (silently dropped by policy).
         }
 
@@ -250,7 +256,13 @@ impl IcmpRelay {
             .evaluate_egress_ip(IpAddr::V6(dst_ip), Protocol::Icmpv6, &self.shared)
             .is_deny()
         {
-            tracing::debug!(dst = %dst_ip, "ICMPv6 echo denied by policy");
+            tracing::debug!(
+                target: "policy_deny",
+                transport = "icmpv6",
+                ip = %dst_ip,
+                sandbox_id = self.shared.sandbox_id().unwrap_or(""),
+                "ICMPv6 echo denied by policy",
+            );
             return true;
         }
 

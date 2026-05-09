@@ -79,6 +79,12 @@ pub struct SharedState {
 
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// Per-sandbox identifier propagated from the runtime config. Surfaced
+    /// in `target: "policy_deny"` tracing events so downstream observers
+    /// can attribute denials to the originating sandbox in multi-sandbox
+    /// hosts. `None` in isolated unit tests.
+    sandbox_id: OnceLock<Arc<str>>,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -122,7 +128,20 @@ impl SharedState {
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            sandbox_id: OnceLock::new(),
         }
+    }
+
+    /// Stamp this shared state with a per-sandbox identifier. First call
+    /// wins; subsequent calls are no-ops (identifier is immutable for the
+    /// sandbox lifetime).
+    pub fn set_sandbox_id(&self, id: Arc<str>) {
+        let _ = self.sandbox_id.set(id);
+    }
+
+    /// Per-sandbox identifier, if set.
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.sandbox_id.get().map(|s| s.as_ref())
     }
 
     /// Set the per-sandbox gateway IPs. Called once at boot. Each family is
@@ -284,6 +303,19 @@ mod tests {
         assert_eq!(state.tx_ring.pop(), Some(vec![1, 2, 3]));
         assert_eq!(state.tx_ring.pop(), Some(vec![4, 5, 6]));
         assert_eq!(state.tx_ring.pop(), None);
+    }
+
+    #[test]
+    fn sandbox_id_set_once() {
+        let state = SharedState::new(4);
+        assert_eq!(state.sandbox_id(), None);
+
+        state.set_sandbox_id(Arc::from("sb-001"));
+        assert_eq!(state.sandbox_id(), Some("sb-001"));
+
+        // First call wins — second call is a no-op.
+        state.set_sandbox_id(Arc::from("sb-002"));
+        assert_eq!(state.sandbox_id(), Some("sb-001"));
     }
 
     #[test]

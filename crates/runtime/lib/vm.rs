@@ -1295,7 +1295,8 @@ fn build_vm(
             .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
 
         let mut network =
-            microsandbox_network::network::SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot);
+            microsandbox_network::network::SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot)
+                .with_sandbox_id(config.sandbox_name.clone());
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
         // Only sandboxes that booted with secrets can be live-reconfigured:

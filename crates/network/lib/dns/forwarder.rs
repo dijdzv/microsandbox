@@ -165,7 +165,13 @@ impl DnsForwarder {
         // default policies fail closed unless a rule allows the name or
         // the DNS protocol/port.
         if decide_dns_action(&self.network_policy, &domain, transport).is_deny() {
-            tracing::debug!(domain = %domain, "DNS query denied by network policy");
+            tracing::debug!(
+                target: "policy_deny",
+                transport = "dns_query",
+                host = %domain,
+                sandbox_id = self.shared.sandbox_id().unwrap_or(""),
+                "DNS query denied by network policy",
+            );
             // NXDOMAIN, not REFUSED: stub resolvers (e.g. glibc) don't
             // fail-fast on REFUSED, so a denied lookup hangs the guest in a
             // deny-by-default sandbox. NXDOMAIN is a synthetic negative that
@@ -199,9 +205,12 @@ impl DnsForwarder {
             UpstreamChoice::Client(c) => c,
             UpstreamChoice::PolicyDenied => {
                 tracing::debug!(
-                    domain = %domain,
-                    ?original_dst,
-                    "DNS resolver denied by network policy"
+                    target: "policy_deny",
+                    transport = "dns_resolver",
+                    host = %domain,
+                    ip = original_dst.map(|ip| ip.to_string()).unwrap_or_default(),
+                    sandbox_id = self.shared.sandbox_id().unwrap_or(""),
+                    "DNS resolver denied by network policy",
                 );
                 return build_status_response(&query_msg, ResponseCode::NXDomain);
             }

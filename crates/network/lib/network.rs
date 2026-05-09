@@ -171,6 +171,14 @@ impl SmoltcpNetwork {
         }
     }
 
+    /// Tag this sandbox with a stable identifier surfaced in
+    /// `target: "policy_deny"` tracing events. Idempotent — first call
+    /// wins (stamps the underlying `SharedState` once).
+    pub fn with_sandbox_id(self, id: impl Into<Arc<str>>) -> Self {
+        self.shared.set_sandbox_id(id.into());
+        self
+    }
+
     /// Get the gateway IPs for virtio-net configuration and domain-based policy rules.
     fn gateway_ips(&self) -> GatewayIps {
         GatewayIps {
