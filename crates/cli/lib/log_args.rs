@@ -1,9 +1,16 @@
 //! Shared CLI verbosity flags for `msb` and its hidden runtime subcommands.
 
+use std::fs::OpenOptions;
+use std::sync::Mutex;
+
 use clap::Args;
 use microsandbox_runtime::logging::LogLevel;
+use tracing::Level;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::Directive;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{Directive, Targets};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -37,27 +44,63 @@ pub struct LogArgs {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Install a tracing subscriber for the selected level.
+/// Install a tracing subscriber for the selected level, plus an optional
+/// `target: "policy_deny"` capture layer that writes one JSON-formatted
+/// event per line to the path in `MSB_DENY_LOG_PATH`. The capture layer
+/// is the only way library callers (who spawn `msb` as a subprocess via
+/// `microsandbox::Sandbox::create()`) can observe network policy denies,
+/// because the deny logic runs in the spawned process and `tracing` is
+/// process-global.
 ///
-/// `ansi` controls whether the formatter emits color escape sequences.
-/// Pass `true` for the user-facing CLI (colored output on a TTY) and
-/// `false` for the sandbox subprocess (whose stderr is captured into
-/// `runtime.log`, where escape codes would be junk).
+/// Both layers are stock `tracing_subscriber::fmt::layer()` instances:
+/// the stderr layer uses the human-formatted output, the deny layer
+/// uses `.json()` so consumers can `serde_json::from_str` each line.
 ///
-/// If no level is selected, logging stays disabled.
+/// `ansi` controls whether the stderr formatter emits color escape
+/// sequences. Pass `true` for the user-facing CLI (colored output on
+/// a TTY) and `false` for the sandbox subprocess (whose stderr is
+/// captured into `runtime.log`, where escape codes would be junk).
+///
+/// If no log level is selected and `MSB_DENY_LOG_PATH` is unset,
+/// logging stays fully disabled — preserves the old behaviour for
+/// unmodified callers.
 pub fn init_tracing(log_level: Option<LogLevel>, ansi: bool) {
-    if let Some(level) = log_level {
+    let stderr_layer = log_level.map(|level| {
         // Silence oci_client logs — the crate logs the auth token in debug mode
         // See: https://github.com/oras-project/rust-oci-client/issues/254
         let filter = EnvFilter::new(level.as_tracing_level().to_string())
             .add_directive("oci_client=info".parse::<Directive>().unwrap());
-
-        tracing_subscriber::fmt()
+        tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
-            .with_env_filter(filter)
             .with_ansi(ansi)
-            .init();
+            .with_filter(filter)
+    });
+
+    let deny_layer = std::env::var("MSB_DENY_LOG_PATH").ok().and_then(|path| {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        Some(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(Mutex::new(file))
+                .with_ansi(false)
+                .with_filter(Targets::new().with_target("policy_deny", Level::TRACE)),
+        )
+    });
+
+    if stderr_layer.is_none() && deny_layer.is_none() {
+        return;
     }
+
+    // try_init so we don't panic if the host process already initialised a
+    // subscriber (msb-ffi callers may have one for diagnostic purposes).
+    let _ = tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(deny_layer)
+        .try_init();
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -125,5 +168,57 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("--debug"));
         assert!(rendered.contains("--info"));
+    }
+
+    #[test]
+    fn deny_log_layer_writes_only_policy_deny_target() {
+        // Build the deny layer manually using the same configuration that
+        // `init_tracing` uses internally, so the test stays in sync if
+        // that wiring changes.
+        let path = std::env::temp_dir().join(format!("msb-deny-test-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_ansi(false)
+            .with_filter(Targets::new().with_target("policy_deny", Level::TRACE));
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "policy_deny", host = "example.com", port = 443u32, "denied");
+            tracing::debug!(target: "other_target", host = "ignored.example", "should not appear");
+        });
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one deny line, got: {body}"
+        );
+        // tracing-subscriber's JSON formatter writes `target` outside of
+        // `fields`. Schema (per the formatter, current shape):
+        //   {"timestamp":"...","level":"DEBUG","fields":{...},"target":"policy_deny"}
+        // We don't assert the exact key order — just the substantive
+        // fields downstream consumers depend on.
+        assert!(
+            lines[0].contains("\"target\":\"policy_deny\""),
+            "got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("\"host\":\"example.com\""),
+            "got: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("\"port\":443"), "got: {}", lines[0]);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
