@@ -69,3 +69,4 @@ system-configuration = "0.7"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tracing-subscriber.workspace = true

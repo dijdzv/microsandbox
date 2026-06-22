@@ -326,15 +326,9 @@ pub fn smoltcp_poll_loop(
                         }
                         // Other: regular outbound — defer Domain rules to first-flight;
                         // accept unless an IP-layer rule denies.
-                        DnsPortType::Other => match network_policy.evaluate_egress_with_source(
-                            dst,
-                            Protocol::Tcp,
-                            &shared,
-                            HostnameSource::Deferred,
-                        ) {
-                            EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname => true,
-                            EgressEvaluation::Deny => false,
-                        },
+                        DnsPortType::Other => {
+                            tcp_syn_allowed_by_policy(&network_policy, dst, &shared)
+                        }
                     };
                     if allow && !conn_tracker.has_socket_for(&src, &dst) {
                         conn_tracker.create_tcp_socket(src, dst, &mut sockets);
@@ -387,10 +381,7 @@ pub fn smoltcp_poll_loop(
                     }
 
                     // Policy check.
-                    if network_policy
-                        .evaluate_egress(dst, Protocol::Udp, &shared)
-                        .is_deny()
-                    {
+                    if !udp_allowed_by_policy(&network_policy, dst, &shared) {
                         device.drop_staged_frame();
                         continue;
                     }
@@ -822,6 +813,60 @@ fn classify_transport(
     }
 }
 
+/// Evaluate a TCP SYN and emit a structured deny event for immediate
+/// IP/group denies. Domain rules are intentionally deferred to proxy-time
+/// hostname inspection.
+fn tcp_syn_allowed_by_policy(
+    network_policy: &NetworkPolicy,
+    dst: SocketAddr,
+    shared: &SharedState,
+) -> bool {
+    let source = HostnameSource::Deferred;
+    match network_policy.evaluate_egress_with_source(dst, Protocol::Tcp, shared, source) {
+        EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname => true,
+        EgressEvaluation::Deny => {
+            log_direct_egress_deny("tcp", dst, source.label(), shared);
+            false
+        }
+    }
+}
+
+/// Evaluate a UDP datagram and emit a structured deny event before dropping it.
+fn udp_allowed_by_policy(
+    network_policy: &NetworkPolicy,
+    dst: SocketAddr,
+    shared: &SharedState,
+) -> bool {
+    if network_policy
+        .evaluate_egress(dst, Protocol::Udp, shared)
+        .is_deny()
+    {
+        log_direct_egress_deny("udp", dst, HostnameSource::CacheOnly.label(), shared);
+        false
+    } else {
+        true
+    }
+}
+
+/// Emit the common event shape consumed by `MSB_DENY_LOG_PATH`.
+fn log_direct_egress_deny(
+    transport: &'static str,
+    dst: SocketAddr,
+    source: &'static str,
+    shared: &SharedState,
+) {
+    tracing::debug!(
+        target: "policy_deny",
+        transport = transport,
+        host = "",
+        ip = %dst.ip(),
+        port = dst.port(),
+        source = source,
+        sandbox_id = shared.sandbox_id().unwrap_or(""),
+        "egress denied by IP policy",
+    );
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -829,15 +874,18 @@ fn classify_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::Arc;
 
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetRepr, Icmpv4Packet, Icmpv4Repr, Ipv4Repr,
     };
+    use tracing_subscriber::{filter::Targets, prelude::*};
 
     use crate::device::SmoltcpDevice;
-    use crate::shared::SharedState;
+    use crate::policy::{Action, Destination, DestinationGroup, Direction, Rule};
+    use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
 
     /// Build a minimal Ethernet + IPv4 + TCP SYN frame.
     fn build_tcp_syn_frame(
@@ -968,6 +1016,91 @@ mod tests {
         .emit(&mut ArpPacket::new_unchecked(&mut frame[14..]));
 
         frame
+    }
+
+    fn metadata_deny_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::deny_egress(Destination::Group(DestinationGroup::Metadata)),
+                Rule {
+                    action: Action::Allow,
+                    direction: Direction::Egress,
+                    destination: Destination::Cidr("0.0.0.0/0".parse().unwrap()),
+                    protocols: vec![],
+                    ports: vec![],
+                },
+            ],
+        }
+    }
+
+    fn capture_policy_deny_events<F: FnOnce()>(name: &str, f: F) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "msb-stack-deny-{name}-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, f);
+
+        std::fs::read_to_string(&path).unwrap_or_default()
+    }
+
+    #[test]
+    fn tcp_syn_metadata_deny_emits_policy_deny_event() {
+        let shared = SharedState::new(DEFAULT_QUEUE_CAPACITY);
+        shared.set_sandbox_id(Arc::<str>::from("sandbox-tcp"));
+        let policy = metadata_deny_policy();
+        let dst = SocketAddr::new(Ipv4Addr::new(169, 254, 169, 254).into(), 80);
+
+        let body = capture_policy_deny_events("tcp", || {
+            assert!(!tcp_syn_allowed_by_policy(&policy, dst, &shared));
+        });
+
+        assert_eq!(body.lines().count(), 1, "got: {body}");
+        assert!(body.contains("\"target\":\"policy_deny\""), "got: {body}");
+        assert!(body.contains("\"transport\":\"tcp\""), "got: {body}");
+        assert!(body.contains("\"ip\":\"169.254.169.254\""), "got: {body}");
+        assert!(body.contains("\"port\":80"), "got: {body}");
+        assert!(
+            body.contains("\"sandbox_id\":\"sandbox-tcp\""),
+            "got: {body}"
+        );
+    }
+
+    #[test]
+    fn udp_metadata_deny_emits_policy_deny_event() {
+        let shared = SharedState::new(DEFAULT_QUEUE_CAPACITY);
+        shared.set_sandbox_id(Arc::<str>::from("sandbox-udp"));
+        let policy = metadata_deny_policy();
+        let dst = SocketAddr::new(Ipv4Addr::new(169, 254, 169, 254).into(), 123);
+
+        let body = capture_policy_deny_events("udp", || {
+            assert!(!udp_allowed_by_policy(&policy, dst, &shared));
+        });
+
+        assert_eq!(body.lines().count(), 1, "got: {body}");
+        assert!(body.contains("\"target\":\"policy_deny\""), "got: {body}");
+        assert!(body.contains("\"transport\":\"udp\""), "got: {body}");
+        assert!(body.contains("\"ip\":\"169.254.169.254\""), "got: {body}");
+        assert!(body.contains("\"port\":123"), "got: {body}");
+        assert!(
+            body.contains("\"sandbox_id\":\"sandbox-udp\""),
+            "got: {body}"
+        );
     }
 
     #[test]
