@@ -3,6 +3,7 @@
 //! Used by `SandboxBuilder::network(|n| n.port(8080, 80).policy(...))`.
 
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
@@ -15,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretSource, ViolationAction,
 };
-use crate::tls::{ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig};
+use crate::tls::{ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig, TlsLoopbackHost};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -334,6 +335,12 @@ impl TlsBuilder {
     /// Add a domain to the bypass list (no MITM). Supports `*.suffix` wildcards.
     pub fn bypass(mut self, pattern: impl Into<String>) -> Self {
         self.config.bypass.push(pattern.into());
+        self
+    }
+
+    /// Route one exact TLS hostname to a fixed host-loopback port.
+    pub fn loopback_route(mut self, host: TlsLoopbackHost, port: NonZeroU16) -> Self {
+        self.config.loopback_routes.insert(host, port);
         self
     }
 

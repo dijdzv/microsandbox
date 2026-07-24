@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 /// the DNS interceptor stores on the resolved-hostname cache, which
 /// lets match-time comparisons be byte-equal rather than
 /// case-insensitive.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct DomainName(String);
 

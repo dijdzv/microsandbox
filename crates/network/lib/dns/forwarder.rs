@@ -47,6 +47,7 @@ use super::nameserver::{read_host_dns_servers, resolve_nameservers};
 use crate::policy::{Action, DomainName, NetworkPolicy};
 use crate::shared::{ResolvedHostnameFamily, SharedState};
 use crate::stack::GatewayIps;
+use crate::tls::TlsLoopbackRoutes;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -109,6 +110,8 @@ pub(crate) struct DnsForwarder {
     /// Gateway IPs returned as A / AAAA answers when the guest asks for
     /// `host.microsandbox.internal`.
     gateway: GatewayIps,
+    /// Exact TLS hosts synthesized to the sandbox gateway.
+    tls_loopback_routes: TlsLoopbackRoutes,
     config: Arc<NormalizedDnsConfig>,
 }
 
@@ -188,6 +191,26 @@ impl DnsForwarder {
             );
             self.shared.clear_resolved_hostname(&domain, family);
             return build_status_response(&query_msg, ResponseCode::NoError);
+        }
+
+        if let Some((family, address)) = tls_loopback_gateway_binding(
+            &domain,
+            query_type,
+            self.gateway,
+            &self.tls_loopback_routes,
+        ) && let Some(response) = synthesize_tls_loopback_response(
+            &query_msg,
+            self.gateway,
+            query_type,
+            &self.tls_loopback_routes,
+        ) {
+            self.shared.cache_resolved_hostname(
+                &domain,
+                family,
+                [address],
+                Duration::from_secs(HOST_ALIAS_TTL_SECS.into()),
+            );
+            return Some(response);
         }
 
         // Locally synthesize answers for the host alias; MX / TXT / etc.
@@ -365,11 +388,19 @@ impl DnsForwarder {
         network_policy: Arc<NetworkPolicy>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
+        tls_loopback_routes: TlsLoopbackRoutes,
     ) -> DnsForwarderHandle {
         let (forwarder_tx, forwarder_rx) = watch::channel(None);
         handle.spawn(async move {
-            let Some(forwarder) =
-                Self::build(config, gateway_ips, network_policy, shared, gateway).await
+            let Some(forwarder) = Self::build(
+                config,
+                gateway_ips,
+                network_policy,
+                shared,
+                gateway,
+                tls_loopback_routes,
+            )
+            .await
             else {
                 // Drop forwarder_tx by returning; waiters observe init
                 // failure as `Self::wait().await == None`.
@@ -389,6 +420,7 @@ impl DnsForwarder {
         network_policy: Arc<NetworkPolicy>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
+        tls_loopback_routes: TlsLoopbackRoutes,
     ) -> Option<Arc<Self>> {
         let upstreams = if !config.nameservers.is_empty() {
             match resolve_nameservers(&config.nameservers).await {
@@ -430,6 +462,7 @@ impl DnsForwarder {
             network_policy,
             shared,
             gateway,
+            tls_loopback_routes,
             config,
         }))
     }
@@ -601,6 +634,33 @@ fn synthesize_host_alias_response(
     response.to_bytes().ok().map(Bytes::from)
 }
 
+/// Synthesize the sandbox gateway for one exact TLS loopback route.
+fn synthesize_tls_loopback_response(
+    query: &Message,
+    gateway: GatewayIps,
+    qtype: RecordType,
+    routes: &TlsLoopbackRoutes,
+) -> Option<Bytes> {
+    let domain = query.queries().first()?.name().to_string();
+    routes.target(domain.trim_end_matches('.'))?;
+    synthesize_host_alias_response(query, gateway, qtype)
+}
+
+/// Return the policy-cache binding represented by a synthesized route answer.
+fn tls_loopback_gateway_binding(
+    domain: &str,
+    qtype: RecordType,
+    gateway: GatewayIps,
+    routes: &TlsLoopbackRoutes,
+) -> Option<(ResolvedHostnameFamily, IpAddr)> {
+    routes.target(domain)?;
+    match qtype {
+        RecordType::A => Some((ResolvedHostnameFamily::Ipv4, IpAddr::V4(gateway.ipv4?))),
+        RecordType::AAAA => Some((ResolvedHostnameFamily::Ipv6, IpAddr::V6(gateway.ipv6?))),
+        _ => None,
+    }
+}
+
 /// Build a header-only NoError response with TC=1. RFC 5966 §3 requires
 /// servers to set TC when truncating; the guest's stub then retries the
 /// query over TCP per RFC 7766.
@@ -622,8 +682,11 @@ fn build_truncated_response(query: &Message) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use super::*;
     use crate::policy::Protocol;
+    use crate::tls::TlsLoopbackRoutes;
     use hickory_client::proto::op::{Edns, MessageType, OpCode, Query};
     use hickory_client::proto::rr::{DNSClass, Name, RecordType};
 
@@ -637,6 +700,47 @@ mod tests {
         q.set_query_class(DNSClass::IN);
         msg.add_query(q);
         msg
+    }
+
+    #[test]
+    fn tls_loopback_route_query_synthesizes_only_the_exact_gateway_alias() {
+        let mut routes = TlsLoopbackRoutes::default();
+        routes.insert(
+            "llm-broker.orbit.invalid".parse().expect("exact host"),
+            NonZeroU16::new(43123).expect("non-zero port"),
+        );
+        let gateway = GatewayIps {
+            ipv4: Some("172.16.0.1".parse().expect("IPv4 gateway")),
+            ipv6: None,
+        };
+
+        let query = make_query("LLM-BROKER.ORBIT.INVALID.", RecordType::A);
+        let bytes = synthesize_tls_loopback_response(&query, gateway, RecordType::A, &routes)
+            .expect("exact route response");
+        let message = Message::from_bytes(&bytes).expect("parse response");
+        assert_eq!(message.answers().len(), 1);
+        assert_eq!(
+            message.answers()[0].data(),
+            &RData::A(A::from("172.16.0.1".parse::<std::net::Ipv4Addr>().unwrap()))
+        );
+        assert_eq!(
+            tls_loopback_gateway_binding(
+                "llm-broker.orbit.invalid",
+                RecordType::A,
+                gateway,
+                &routes,
+            ),
+            Some((
+                ResolvedHostnameFamily::Ipv4,
+                "172.16.0.1".parse().expect("gateway address"),
+            ))
+        );
+
+        let suffix_query = make_query("other.llm-broker.orbit.invalid.", RecordType::A);
+        assert!(
+            synthesize_tls_loopback_response(&suffix_query, gateway, RecordType::A, &routes,)
+                .is_none()
+        );
     }
 
     #[test]

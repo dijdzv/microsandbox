@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use super::TlsConfig;
 use super::sni;
 use super::state::TlsState;
 use crate::conn::ProxyConnectState;
@@ -37,6 +38,12 @@ const RELAY_BUF_SIZE: usize = 16384;
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterceptUpstream {
+    Tls(SocketAddr),
+    PlainLoopback(SocketAddr),
+}
 
 pub(crate) struct TlsProxyContext {
     pub(crate) guest_dst: SocketAddr,
@@ -160,7 +167,9 @@ pub(crate) async fn tls_proxy_task(
         return Ok(());
     }
 
-    if tls_state.should_bypass(&sni_name) {
+    let intercept_upstream = intercept_upstream(&tls_state.config, &sni_name, connect_dst);
+    if matches!(intercept_upstream, InterceptUpstream::Tls(_)) && tls_state.should_bypass(&sni_name)
+    {
         tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
         bypass_relay(
             connect_dst,
@@ -176,7 +185,7 @@ pub(crate) async fn tls_proxy_task(
         tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS intercept");
         intercept_relay(
             guest_dst,
-            connect_dst,
+            intercept_upstream,
             &sni_name,
             via_connect,
             initial_buf,
@@ -238,9 +247,9 @@ async fn bypass_relay(
 
 /// Intercept mode: MITM with guest-facing rustls + server-facing tokio_rustls.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn intercept_relay(
+async fn intercept_relay(
     guest_dst: SocketAddr,
-    connect_dst: SocketAddr,
+    upstream: InterceptUpstream,
     sni_name: &str,
     via_connect: bool,
     initial_buf: Vec<u8>,
@@ -307,19 +316,65 @@ pub(crate) async fn intercept_relay(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
 
-    // Connect to real server with TLS.
-    let server_stream = match upstream_stream {
-        Some(s) => s,
-        None => connect_upstream(connect_dst, &proxy_connect, &shared).await?,
-    };
-    let server_name = ServerName::try_from(sni_name.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut server_tls = tls_state
-        .upstream_connector_for(sni_name)
-        .connect(server_name, server_stream)
-        .await
-        .map_err(io::Error::other)?;
+    match upstream {
+        InterceptUpstream::PlainLoopback(target) => {
+            if upstream_stream.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TLS loopback route cannot use a preconnected upstream",
+                ));
+            }
+            let mut server = connect_upstream(target, &proxy_connect, &shared).await?;
+            relay_intercepted_plaintext(
+                &mut guest_tls,
+                &mut server,
+                &mut secrets_handler,
+                &mut from_smoltcp,
+                &to_smoltcp,
+                &shared,
+                &mut tls_buf,
+            )
+            .await
+        }
+        InterceptUpstream::Tls(connect_dst) => {
+            let server_stream = match upstream_stream {
+                Some(stream) => stream,
+                None => connect_upstream(connect_dst, &proxy_connect, &shared).await?,
+            };
+            let server_name = ServerName::try_from(sni_name.to_string())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let mut server_tls = tls_state
+                .upstream_connector_for(sni_name)
+                .connect(server_name, server_stream)
+                .await
+                .map_err(io::Error::other)?;
+            relay_intercepted_plaintext(
+                &mut guest_tls,
+                &mut server_tls,
+                &mut secrets_handler,
+                &mut from_smoltcp,
+                &to_smoltcp,
+                &shared,
+                &mut tls_buf,
+            )
+            .await
+        }
+    }
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn relay_intercepted_plaintext<S>(
+    guest_tls: &mut rustls::ServerConnection,
+    server: &mut S,
+    secrets_handler: &mut SecretsHandler,
+    from_smoltcp: &mut mpsc::Receiver<Bytes>,
+    to_smoltcp: &mpsc::Sender<Bytes>,
+    shared: &SharedState,
+    tls_buf: &mut Vec<u8>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Phase 2: Bidirectional plaintext relay.
     let mut server_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut plaintext_buf = vec![0u8; RELAY_BUF_SIZE];
@@ -329,10 +384,10 @@ pub(crate) async fn intercept_relay(
     // flight, so process_new_packets() during the handshake loop may have
     // already decrypted the first HTTP request into the plaintext buffer.
     forward_plaintext(
-        &mut guest_tls,
-        &mut server_tls,
-        &mut secrets_handler,
-        &shared,
+        guest_tls,
+        server,
+        secrets_handler,
+        shared,
         &mut plaintext_buf,
     )
     .await?;
@@ -355,10 +410,10 @@ pub(crate) async fn intercept_relay(
                         .process_new_packets()
                         .map_err(io::Error::other)?;
                     forward_plaintext(
-                        &mut guest_tls,
-                        &mut server_tls,
-                        &mut secrets_handler,
-                        &shared,
+                        guest_tls,
+                        server,
+                        secrets_handler,
+                        shared,
                         &mut plaintext_buf,
                     )
                     .await?;
@@ -366,7 +421,7 @@ pub(crate) async fn intercept_relay(
             }
 
             // Server → guest: read plaintext, encrypt, send via channel.
-            result = server_tls.read(&mut server_buf) => {
+            result = server.read(&mut server_buf) => {
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
@@ -374,7 +429,7 @@ pub(crate) async fn intercept_relay(
                             .writer()
                             .write_all(&server_buf[..n])
                             .map_err(io::Error::other)?;
-                        flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+                        flush_to_guest(guest_tls, to_smoltcp, shared, tls_buf).await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -383,6 +438,17 @@ pub(crate) async fn intercept_relay(
     }
 
     Ok(())
+}
+
+fn intercept_upstream(
+    config: &TlsConfig,
+    sni_name: &str,
+    connect_dst: SocketAddr,
+) -> InterceptUpstream {
+    match config.loopback_routes.target(sni_name) {
+        Some(target) => InterceptUpstream::PlainLoopback(target),
+        None => InterceptUpstream::Tls(connect_dst),
+    }
 }
 
 /// Buffer channel data until a complete ClientHello with SNI is received.
@@ -427,13 +493,16 @@ pub(crate) async fn extract_sni_from_channel(
 /// Read all available decrypted plaintext from the guest-facing TLS
 /// connection and forward it to the upstream server, applying secret
 /// substitution when configured.
-async fn forward_plaintext(
+async fn forward_plaintext<S>(
     guest_tls: &mut rustls::ServerConnection,
-    server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    server: &mut S,
     secrets_handler: &mut SecretsHandler,
     shared: &SharedState,
     buf: &mut [u8],
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut wrote_plaintext = false;
 
     loop {
@@ -445,7 +514,7 @@ async fn forward_plaintext(
         };
 
         if secrets_handler.is_empty() {
-            server_tls.write_all(&buf[..n]).await?;
+            server.write_all(&buf[..n]).await?;
             wrote_plaintext = true;
             continue;
         }
@@ -453,7 +522,7 @@ async fn forward_plaintext(
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
                 if !data.is_empty() {
-                    server_tls.write_all(&data).await?;
+                    server.write_all(&data).await?;
                     wrote_plaintext = true;
                 }
             }
@@ -473,7 +542,7 @@ async fn forward_plaintext(
     // tokio-rustls buffers writes; flush each drained plaintext batch so
     // upstream servers waiting for the full request body can respond.
     if wrote_plaintext {
-        server_tls.flush().await?;
+        server.flush().await?;
     }
 
     Ok(())
@@ -502,4 +571,35 @@ async fn flush_to_guest(
         }
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU16;
+
+    use super::*;
+    use crate::tls::TlsConfig;
+
+    #[test]
+    fn intercept_upstream_routes_only_exact_hosts_to_fixed_loopback() {
+        let mut config = TlsConfig::default();
+        config.loopback_routes.insert(
+            "llm-broker.orbit.invalid".parse().expect("exact host"),
+            NonZeroU16::new(43123).expect("non-zero port"),
+        );
+        let public = "203.0.113.10:443".parse().expect("public target");
+
+        assert_eq!(
+            intercept_upstream(&config, "LLM-BROKER.ORBIT.INVALID.", public),
+            InterceptUpstream::PlainLoopback("127.0.0.1:43123".parse().expect("loopback target"))
+        );
+        assert_eq!(
+            intercept_upstream(&config, "other.llm-broker.orbit.invalid", public),
+            InterceptUpstream::Tls(public)
+        );
+    }
 }

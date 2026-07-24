@@ -250,6 +250,10 @@ pub fn smoltcp_poll_loop(
     // so `DestinationGroup::Host` rules can resolve to the right address.
     shared.set_gateway_ips(config.gateway.ipv4, config.gateway.ipv6);
     let network_policy = Arc::new(network_policy);
+    let tls_loopback_routes = tls_state
+        .as_ref()
+        .map(|state| state.config.loopback_routes.clone())
+        .unwrap_or_default();
 
     let (mut dns_interceptor, dns_forwarder_handle) = DnsInterceptor::new(
         &mut sockets,
@@ -261,6 +265,7 @@ pub fn smoltcp_poll_loop(
         config.gateway,
         config.gateway_mac,
         config.guest_mac,
+        tls_loopback_routes,
     );
     let mut port_publisher = PortPublisher::new(
         &published_ports,

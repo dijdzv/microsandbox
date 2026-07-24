@@ -29,6 +29,7 @@ use crate::config::DnsConfig;
 use crate::policy::NetworkPolicy;
 use crate::shared::SharedState;
 use crate::stack::GatewayIps;
+use crate::tls::TlsLoopbackRoutes;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -100,6 +101,7 @@ impl DnsInterceptor {
         gateway: GatewayIps,
         gateway_mac: [u8; 6],
         guest_mac: [u8; 6],
+        tls_loopback_routes: TlsLoopbackRoutes,
     ) -> (Self, DnsForwarderHandle) {
         // Create and bind the smoltcp UDP socket.
         let rx_meta = vec![PacketMetadata::EMPTY; DNS_SOCKET_PACKET_SLOTS];
@@ -139,6 +141,7 @@ impl DnsInterceptor {
             network_policy,
             shared.clone(),
             gateway,
+            tls_loopback_routes,
         );
         UdpProxy::spawn(
             tokio_handle,

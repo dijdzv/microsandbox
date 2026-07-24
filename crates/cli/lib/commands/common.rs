@@ -1,5 +1,6 @@
 //! Common sandbox configuration flags shared between commands.
 
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -346,6 +347,11 @@ pub struct SandboxOpts {
     #[arg(long)]
     pub tls_bypass: Vec<String>,
 
+    /// Route an exact TLS host to a host-loopback listener (`HOST:PORT`).
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "HOST:PORT")]
+    pub tls_loopback_route: Vec<String>,
+
     /// Allow QUIC/HTTP3 traffic (blocked by default when TLS interception is on).
     #[cfg(feature = "net")]
     #[arg(long)]
@@ -498,6 +504,7 @@ impl SandboxOpts {
             || self.tls_intercept
             || !self.tls_intercept_port.is_empty()
             || !self.tls_bypass.is_empty()
+            || !self.tls_loopback_route.is_empty()
             || self.no_block_quic
             || self.tls_intercept_ca_cert.is_some()
             || self.tls_intercept_ca_key.is_some()
@@ -1334,6 +1341,7 @@ fn apply_network_opts(
         || opts.tls_intercept
         || !opts.tls_intercept_port.is_empty()
         || !opts.tls_bypass.is_empty()
+        || !opts.tls_loopback_route.is_empty()
         || opts.no_block_quic
         || opts.tls_intercept_ca_cert.is_some()
         || opts.tls_intercept_ca_key.is_some()
@@ -1378,6 +1386,11 @@ fn apply_network_opts(
         let tls_intercept = opts.tls_intercept;
         let tls_ports = opts.tls_intercept_port.clone();
         let tls_bypass = opts.tls_bypass.clone();
+        let tls_loopback_routes = opts
+            .tls_loopback_route
+            .iter()
+            .map(|spec| parse_tls_loopback_route(spec))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let no_block_quic = opts.no_block_quic;
         let intercept_ca_cert = opts.tls_intercept_ca_cert.clone();
         let intercept_ca_key = opts.tls_intercept_ca_key.clone();
@@ -1428,6 +1441,7 @@ fn apply_network_opts(
             let has_tls = tls_intercept
                 || !tls_ports.is_empty()
                 || !tls_bypass.is_empty()
+                || !tls_loopback_routes.is_empty()
                 || no_block_quic
                 || intercept_ca_cert.is_some()
                 || intercept_ca_key.is_some()
@@ -1438,6 +1452,7 @@ fn apply_network_opts(
             if has_tls {
                 let tls_ports = tls_ports.clone();
                 let tls_bypass = tls_bypass.clone();
+                let tls_loopback_routes = tls_loopback_routes.clone();
                 let intercept_ca_cert = intercept_ca_cert.clone();
                 let intercept_ca_key = intercept_ca_key.clone();
                 let upstream_ca_cert = upstream_ca_cert.clone();
@@ -1449,6 +1464,9 @@ fn apply_network_opts(
                     }
                     for domain in &tls_bypass {
                         t = t.bypass(domain);
+                    }
+                    for (host, port) in &tls_loopback_routes {
+                        t = t.loopback_route(host.clone(), *port);
                     }
                     if no_block_quic {
                         t = t.block_quic(false);
@@ -1697,6 +1715,26 @@ fn parse_scoped_upstream_ca_cert(spec: &str) -> anyhow::Result<(String, PathBuf)
         .ok_or_else(|| anyhow::anyhow!("scoped upstream CA must be in format PATTERN=PATH"))?;
 
     Ok((pattern.to_string(), PathBuf::from(path)))
+}
+
+/// Parse an exact host-loopback TLS route: `HOST:PORT`.
+#[cfg(feature = "net")]
+fn parse_tls_loopback_route(
+    spec: &str,
+) -> anyhow::Result<(microsandbox_network::tls::TlsLoopbackHost, NonZeroU16)> {
+    let (host, port) = spec
+        .rsplit_once(':')
+        .filter(|(host, port)| !host.is_empty() && !port.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TLS loopback route must be in format HOST:PORT"))?;
+    let host = host
+        .parse::<microsandbox_network::tls::TlsLoopbackHost>()
+        .map_err(anyhow::Error::from)?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("TLS loopback route port must be a u16"))?;
+    let port = NonZeroU16::new(port)
+        .ok_or_else(|| anyhow::anyhow!("TLS loopback route port must be non-zero"))?;
+    Ok((host, port))
 }
 
 /// Parse a violation action string.
@@ -2190,6 +2228,58 @@ mod tests {
             .to_string();
 
         assert_eq!(err, "scoped upstream CA must be in format PATTERN=PATH");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_tls_loopback_route_accepts_exact_host_and_nonzero_port() {
+        let (host, port) = parse_tls_loopback_route("LLM-BROKER.ORBIT.INVALID.:43123")
+            .expect("valid exact loopback route");
+
+        assert_eq!(String::from(host), "llm-broker.orbit.invalid");
+        assert_eq!(port.get(), 43123);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_tls_loopback_route_rejects_wildcard_zero_and_missing_port() {
+        for invalid in [
+            "*.orbit.invalid:43123",
+            "llm-broker.orbit.invalid:0",
+            "llm-broker.orbit.invalid",
+        ] {
+            assert!(
+                parse_tls_loopback_route(invalid).is_err(),
+                "route should be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn apply_sandbox_opts_wires_tls_loopback_route_into_network_config() {
+        let opts = SandboxOpts {
+            tls_intercept: true,
+            tls_loopback_route: vec!["llm-broker.orbit.invalid:43123".to_string()],
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let network: microsandbox_network::config::NetworkConfig = serde_json::from_value(
+            serde_json::to_value(&config.spec.network).expect("serialize network spec"),
+        )
+        .expect("deserialize network config");
+
+        assert_eq!(
+            network
+                .tls
+                .loopback_routes
+                .target("llm-broker.orbit.invalid"),
+            Some("127.0.0.1:43123".parse().expect("loopback target"))
+        );
     }
 
     #[cfg(feature = "net")]

@@ -4,9 +4,14 @@
 //! All TCP connections terminate at smoltcp, so TLS interception is handled
 //! directly by proxy tasks — no kernel redirect rules needed.
 
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::policy::{DomainName, DomainNameError};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -26,6 +31,13 @@ pub struct TlsConfig {
     /// Domains to bypass (no MITM). Supports exact match and `*.suffix` wildcards.
     #[serde(default)]
     pub bypass: Vec<String>,
+
+    /// Exact TLS hostnames redirected to a host loopback listener.
+    ///
+    /// Only the port is configurable. The destination address is always
+    /// `127.0.0.1`, so this cannot become an arbitrary host-side proxy.
+    #[serde(default)]
+    pub loopback_routes: TlsLoopbackRoutes,
 
     /// Whether to verify the upstream server's TLS certificate.
     #[serde(default = "default_true")]
@@ -78,6 +90,28 @@ pub struct ScopedVerifyUpstream {
     pub verify: bool,
 }
 
+/// Exact TLS hostname routes to host loopback listeners.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TlsLoopbackRoutes(BTreeMap<TlsLoopbackHost, NonZeroU16>);
+
+/// A validated exact hostname for a host-loopback TLS route.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TlsLoopbackHost(DomainName);
+
+/// Errors reported when a TLS loopback route host is not exact.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum TlsLoopbackHostError {
+    /// The hostname is not a valid DNS name.
+    #[error(transparent)]
+    InvalidDomain(#[from] DomainNameError),
+
+    /// Wildcards would make a loopback route broader than one exact hostname.
+    #[error("TLS loopback route host must not contain a wildcard")]
+    Wildcard,
+}
+
 /// Certificate authority configuration for TLS interception.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterceptCaConfig {
@@ -114,6 +148,7 @@ impl Default for TlsConfig {
             enabled: false,
             intercepted_ports: default_intercepted_ports(),
             bypass: Vec::new(),
+            loopback_routes: TlsLoopbackRoutes::default(),
             verify_upstream: true,
             block_quic_on_intercept: true,
             upstream_ca_cert: Vec::new(),
@@ -135,6 +170,50 @@ impl Default for CertCacheConfig {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl TlsLoopbackRoutes {
+    /// Add or replace the loopback port for one exact, validated hostname.
+    pub fn insert(&mut self, host: TlsLoopbackHost, port: NonZeroU16) {
+        self.0.insert(host, port);
+    }
+
+    /// Resolve an exact SNI hostname to the fixed host-loopback destination.
+    pub fn target(&self, host: &str) -> Option<SocketAddr> {
+        let host = host.parse::<TlsLoopbackHost>().ok()?;
+        self.0
+            .get(&host)
+            .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.get()))
+    }
+}
+
+impl std::str::FromStr for TlsLoopbackHost {
+    type Err = TlsLoopbackHostError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::try_from(raw.to_owned())
+    }
+}
+
+impl TryFrom<String> for TlsLoopbackHost {
+    type Error = TlsLoopbackHostError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        if raw.contains('*') {
+            return Err(TlsLoopbackHostError::Wildcard);
+        }
+        Ok(Self(raw.parse()?))
+    }
+}
+
+impl From<TlsLoopbackHost> for String {
+    fn from(host: TlsLoopbackHost) -> Self {
+        host.0.as_str().to_owned()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
@@ -152,4 +231,65 @@ fn default_cache_capacity() -> usize {
 
 fn default_cert_validity_hours() -> u64 {
     24
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::num::NonZeroU16;
+
+    use super::*;
+
+    #[test]
+    fn loopback_routes_match_only_the_exact_canonical_host() {
+        let mut routes = TlsLoopbackRoutes::default();
+        routes.insert(
+            "LLM-BROKER.ORBIT.INVALID."
+                .parse()
+                .expect("valid exact host"),
+            NonZeroU16::new(43123).expect("non-zero port"),
+        );
+
+        assert_eq!(
+            routes.target("llm-broker.orbit.invalid"),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43123))
+        );
+        assert_eq!(
+            routes.target("LLM-BROKER.ORBIT.INVALID."),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43123))
+        );
+        assert_eq!(routes.target("other.llm-broker.orbit.invalid"), None);
+    }
+
+    #[test]
+    fn loopback_routes_deserialize_validated_hosts_and_nonzero_ports() {
+        let config: TlsConfig = serde_json::from_str(
+            r#"{
+                "loopback_routes": {
+                    "llm-broker.orbit.invalid": 43123
+                }
+            }"#,
+        )
+        .expect("valid loopback route");
+
+        assert_eq!(
+            config.loopback_routes.target("llm-broker.orbit.invalid"),
+            Some("127.0.0.1:43123".parse().expect("socket address"))
+        );
+
+        assert!(
+            serde_json::from_str::<TlsConfig>(r#"{"loopback_routes":{"*.orbit.invalid":43123}}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<TlsConfig>(
+                r#"{"loopback_routes":{"llm-broker.orbit.invalid":0}}"#
+            )
+            .is_err()
+        );
+    }
 }
