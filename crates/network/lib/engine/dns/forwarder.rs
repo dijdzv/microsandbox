@@ -292,6 +292,15 @@ impl DnsForwarder {
         // the DNS protocol/port.
         if decide_dns_action(&self.network_policy, &domain, transport).is_deny() {
             tracing::debug!(domain = %domain, "DNS query denied by network policy");
+            self.shared.emit_policy_deny(
+                "dns",
+                &domain,
+                original_dst,
+                transport.upstream_port(),
+                "query",
+                "tenant",
+                "dns_query_policy",
+            );
             // NXDOMAIN, not REFUSED: stub resolvers (e.g. glibc) don't
             // fail-fast on REFUSED, so a denied lookup hangs the guest in a
             // deny-by-default sandbox. NXDOMAIN is a synthetic negative that
@@ -818,10 +827,31 @@ fn decide_upstream_with_platform(
         platform
             .evaluate_egress(policy_dst, transport.policy_protocol(), shared)
             .is_deny()
-    }) || policy
+    }) {
+        shared.emit_policy_deny(
+            "dns",
+            "",
+            Some(dst),
+            policy_dst.port(),
+            "resolver",
+            "platform",
+            "dns_upstream_policy",
+        );
+        return UpstreamDecision::PolicyDenied;
+    }
+    if policy
         .evaluate_egress(policy_dst, transport.policy_protocol(), shared)
         .is_deny()
     {
+        shared.emit_policy_deny(
+            "dns",
+            "",
+            Some(dst),
+            policy_dst.port(),
+            "resolver",
+            "tenant",
+            "dns_upstream_policy",
+        );
         return UpstreamDecision::PolicyDenied;
     }
     UpstreamDecision::Direct(policy_dst)
@@ -1016,8 +1046,14 @@ mod tests {
     use crate::policy::{Action, Destination, NetworkProfile, Protocol, Rule};
     use hickory_net::proto::op::{Edns, MessageType, OpCode, Query};
     use hickory_net::proto::rr::{DNSClass, Name, RecordType};
+    use std::fs::OpenOptions;
+    use std::io::Read;
     use std::net::Ipv4Addr;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn make_query(name: &str, qtype: RecordType) -> Message {
         let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
@@ -1600,21 +1636,46 @@ mod tests {
     fn platform_public_floor_denies_private_direct_resolver() {
         let gateways = gateway_set();
         let shared = SharedState::new(4);
+        shared.set_sandbox_id(Arc::<str>::from("dns-platform"));
         let tenant = NetworkPolicy::allow_all();
         let platform = NetworkPolicy::from_profiles([NetworkProfile::Public]);
         let dst = Some(IpAddr::V4("10.0.0.53".parse().unwrap()));
-
-        assert_eq!(
-            decide_upstream_with_platform(
-                &gateways,
-                &tenant,
-                Some(&platform),
-                &shared,
-                dst,
-                Transport::Udp,
-            ),
-            UpstreamDecision::PolicyDenied
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            assert_eq!(
+                decide_upstream_with_platform(
+                    &gateways,
+                    &tenant,
+                    Some(&platform),
+                    &shared,
+                    dst,
+                    Transport::Udp,
+                ),
+                UpstreamDecision::PolicyDenied
+            );
+        });
+        let mut body = String::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(row["fields"]["sandbox_id"], "dns-platform");
+        assert_eq!(row["fields"]["policy_origin"], "platform");
+        assert_eq!(row["fields"]["ip"], "10.0.0.53");
+        assert_eq!(row["fields"]["port"], 53);
     }
 
     #[test]
@@ -1803,6 +1864,54 @@ mod tests {
             decide_dns_action(&policy, "example.com", Transport::Dot),
             Action::Deny
         );
+    }
+
+    #[tokio::test]
+    async fn denied_dns_query_emits_named_policy_event() {
+        let mut forwarder = forwarder_over(&[]).await;
+        let inner = Arc::get_mut(&mut forwarder).unwrap();
+        inner.network_policy = Arc::new(NetworkPolicy::none());
+        inner.shared.set_sandbox_id(Arc::<str>::from("dns-query"));
+        let query = make_query("blocked.example.", RecordType::A)
+            .to_bytes()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        let response = forwarder
+            .forward(&query, None, Transport::Udp, None)
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            Message::from_bytes(&response)
+                .unwrap()
+                .metadata
+                .response_code,
+            ResponseCode::NXDomain
+        );
+        let mut body = String::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(row["fields"]["sandbox_id"], "dns-query");
+        assert_eq!(row["fields"]["transport"], "dns");
+        assert_eq!(row["fields"]["host"], "blocked.example");
+        assert_eq!(row["fields"]["policy_origin"], "tenant");
+        assert_eq!(row["fields"]["reason"], "dns_query_policy");
     }
 
     #[test]

@@ -394,23 +394,12 @@ pub fn smoltcp_poll_loop(
                         }
                         // Other: regular outbound — defer Domain rules to first-flight;
                         // accept unless an IP-layer rule denies.
-                        DnsPortType::Other => {
-                            let platform_allows = platform_policy.as_deref().is_none_or(|policy| {
-                                policy
-                                    .evaluate_egress(dst, Protocol::Tcp, &shared)
-                                    .is_allow()
-                            });
-                            platform_allows
-                                && matches!(
-                                    network_policy.evaluate_egress_with_source(
-                                        dst,
-                                        Protocol::Tcp,
-                                        &shared,
-                                        HostnameSource::Deferred,
-                                    ),
-                                    EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname
-                                )
-                        }
+                        DnsPortType::Other => tcp_syn_allowed_by_policy(
+                            &network_policy,
+                            platform_policy.as_deref(),
+                            dst,
+                            &shared,
+                        ),
                     };
                     if allow && !conn_tracker.has_socket_for(&src, &dst) {
                         conn_tracker.create_tcp_socket(src, dst, &mut sockets);
@@ -726,6 +715,88 @@ fn sleep_until_stack_wake_windows(
     }
 }
 
+/// Preserve the platform-first policy decision while recording direct TCP denies.
+fn tcp_syn_allowed_by_policy(
+    network_policy: &NetworkPolicy,
+    platform_policy: Option<&NetworkPolicy>,
+    dst: SocketAddr,
+    shared: &SharedState,
+) -> bool {
+    if platform_policy
+        .is_some_and(|policy| policy.evaluate_egress(dst, Protocol::Tcp, shared).is_deny())
+    {
+        shared.emit_policy_deny(
+            "tcp",
+            "",
+            Some(dst.ip()),
+            dst.port(),
+            "packet",
+            "platform",
+            "egress_policy",
+        );
+        return false;
+    }
+    match network_policy.evaluate_egress_with_source(
+        dst,
+        Protocol::Tcp,
+        shared,
+        HostnameSource::Deferred,
+    ) {
+        EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname => true,
+        EgressEvaluation::Deny => {
+            shared.emit_policy_deny(
+                "tcp",
+                "",
+                Some(dst.ip()),
+                dst.port(),
+                "packet",
+                "tenant",
+                "egress_policy",
+            );
+            false
+        }
+    }
+}
+
+/// Preserve the platform-first policy decision while recording direct UDP denies.
+fn udp_allowed_by_policy(
+    network_policy: &NetworkPolicy,
+    platform_policy: Option<&NetworkPolicy>,
+    dst: SocketAddr,
+    shared: &SharedState,
+) -> bool {
+    if platform_policy
+        .is_some_and(|policy| policy.evaluate_egress(dst, Protocol::Udp, shared).is_deny())
+    {
+        shared.emit_policy_deny(
+            "udp",
+            "",
+            Some(dst.ip()),
+            dst.port(),
+            "packet",
+            "platform",
+            "egress_policy",
+        );
+        return false;
+    }
+    if network_policy
+        .evaluate_egress(dst, Protocol::Udp, shared)
+        .is_deny()
+    {
+        shared.emit_policy_deny(
+            "udp",
+            "",
+            Some(dst.ip()),
+            dst.port(),
+            "packet",
+            "tenant",
+            "egress_policy",
+        );
+        return false;
+    }
+    true
+}
+
 /// Apply the common non-DNS UDP dispatch path to a complete guest datagram.
 #[allow(clippy::too_many_arguments)]
 fn relay_udp_frame(
@@ -766,12 +837,7 @@ fn relay_udp_frame(
     }
 
     // Policy is applied after reassembly, when the UDP destination port is known.
-    if platform_policy
-        .is_some_and(|policy| policy.evaluate_egress(dst, Protocol::Udp, shared).is_deny())
-        || network_policy
-            .evaluate_egress(dst, Protocol::Udp, shared)
-            .is_deny()
-    {
+    if !udp_allowed_by_policy(network_policy, platform_policy, dst, shared) {
         return;
     }
 
@@ -908,6 +974,24 @@ fn handle_gateway_icmp_echo(
             .is_deny()
     });
     if tenant_denied || platform_denied {
+        let transport = match reply.protocol {
+            Protocol::Icmpv4 => "icmpv4",
+            Protocol::Icmpv6 => "icmpv6",
+            _ => unreachable!("gateway echo must be ICMP"),
+        };
+        shared.emit_policy_deny(
+            transport,
+            "",
+            Some(reply.dst),
+            0,
+            "packet",
+            if platform_denied {
+                "platform"
+            } else {
+                "tenant"
+            },
+            "egress_policy",
+        );
         tracing::debug!(
             dst = %reply.dst,
             tenant_denied,
@@ -1132,15 +1216,97 @@ fn classify_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Read;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetRepr, Icmpv4Packet, Icmpv4Repr, Ipv4Repr,
     };
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::super::{device::SmoltcpDevice, shared::SharedState};
     use crate::tcp::connection::NewConnection;
+
+    fn captured_deny_rows(run: impl FnOnce(&SharedState)) -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        let shared = SharedState::new(4);
+        shared.set_sandbox_id(Arc::<str>::from("sandbox-direct"));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            run(&shared);
+        });
+        let mut body = String::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        body.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn direct_tcp_and_udp_platform_denies_emit_without_changing_decision() {
+        let tenant = NetworkPolicy::builder().default_allow().build().unwrap();
+        let platform = NetworkPolicy::builder().default_deny().build().unwrap();
+        let dst = SocketAddr::new(Ipv4Addr::new(169, 254, 169, 254).into(), 80);
+        let rows = captured_deny_rows(|shared| {
+            assert!(!tcp_syn_allowed_by_policy(
+                &tenant,
+                Some(&platform),
+                dst,
+                shared
+            ));
+            assert!(!udp_allowed_by_policy(
+                &tenant,
+                Some(&platform),
+                dst,
+                shared
+            ));
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["fields"]["transport"], "tcp");
+        assert_eq!(rows[1]["fields"]["transport"], "udp");
+        for row in rows {
+            assert_eq!(row["fields"]["policy_origin"], "platform");
+            assert_eq!(row["fields"]["sandbox_id"], "sandbox-direct");
+            assert_eq!(row["fields"]["ip"], "169.254.169.254");
+            assert_eq!(row["fields"]["port"], 80);
+        }
+    }
+
+    #[test]
+    fn direct_tcp_tenant_deny_is_not_misattributed_to_platform() {
+        let tenant = NetworkPolicy::builder().default_deny().build().unwrap();
+        let platform = NetworkPolicy::builder().default_allow().build().unwrap();
+        let dst = SocketAddr::new(Ipv4Addr::new(169, 254, 169, 254).into(), 443);
+        let rows = captured_deny_rows(|shared| {
+            assert!(!tcp_syn_allowed_by_policy(
+                &tenant,
+                Some(&platform),
+                dst,
+                shared
+            ));
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["fields"]["policy_origin"], "tenant");
+    }
 
     /// Build a minimal Ethernet + IPv4 + TCP SYN frame.
     fn build_tcp_syn_frame(
@@ -1537,6 +1703,46 @@ mod tests {
             shared.rx_ring.pop().is_none(),
             "denied gateway ICMP should not queue a reply"
         );
+    }
+
+    #[test]
+    fn gateway_icmp_deny_emits_policy_origin() {
+        let rows = captured_deny_rows(|shared| {
+            let gateway = Ipv4Addr::new(100, 96, 0, 1);
+            let guest = Ipv4Addr::new(100, 96, 0, 2);
+            let config = PollLoopConfig {
+                gateway_mac: [0x02, 0, 0, 0, 0, 1],
+                guest_mac: [0x02, 0, 0, 0, 0, 2],
+                gateway: GatewayIps {
+                    ipv4: Some(gateway),
+                    ipv6: None,
+                },
+                guest_ipv4: Some(guest),
+                guest_ipv6: None,
+                mtu: 1500,
+            };
+            let frame = build_icmpv4_echo_frame(
+                config.guest_mac,
+                config.gateway_mac,
+                guest.octets(),
+                gateway.octets(),
+                1,
+                1,
+                b"ping",
+            );
+            let platform = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+            assert!(handle_gateway_icmp_echo(
+                &frame,
+                &config,
+                shared,
+                &NetworkPolicy::allow_all(),
+                Some(&platform),
+            ));
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["fields"]["transport"], "icmpv4");
+        assert_eq!(rows[0]["fields"]["policy_origin"], "platform");
+        assert_eq!(rows[0]["fields"]["sandbox_id"], "sandbox-direct");
     }
 
     #[test]

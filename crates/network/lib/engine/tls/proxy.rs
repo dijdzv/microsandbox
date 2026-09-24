@@ -194,6 +194,15 @@ impl TlsProxy {
                 dst = %guest_dst,
                 "TLS egress denied by domain policy",
             );
+            shared.emit_policy_deny(
+                "tcp",
+                &sni_name,
+                Some(guest_dst.ip()),
+                guest_dst.port(),
+                "sni",
+                "tenant",
+                "domain_policy",
+            );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
             return Ok(());
@@ -213,6 +222,15 @@ impl TlsProxy {
                 sni = %sni_name,
                 dst = %guest_dst,
                 "TLS bypass denied by strict hostname policy",
+            );
+            shared.emit_policy_deny(
+                "tcp",
+                &sni_name,
+                Some(guest_dst.ip()),
+                guest_dst.port(),
+                "sni",
+                "tenant",
+                "strict_hostname_policy",
             );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();

@@ -171,14 +171,13 @@ impl IcmpRelay {
         };
 
         // Policy check.
-        if platform_policy.is_some_and(|platform| {
-            platform
-                .evaluate_egress_ip(IpAddr::V4(dst_ip), Protocol::Icmpv4, &self.shared)
-                .is_deny()
-        }) || policy
-            .evaluate_egress_ip(IpAddr::V4(dst_ip), Protocol::Icmpv4, &self.shared)
-            .is_deny()
-        {
+        if !icmp_allowed_by_policy(
+            &self.shared,
+            policy,
+            platform_policy,
+            IpAddr::V4(dst_ip),
+            Protocol::Icmpv4,
+        ) {
             tracing::debug!(dst = %dst_ip, "ICMP echo denied by policy");
             return true; // Consumed (silently dropped by policy).
         }
@@ -252,14 +251,13 @@ impl IcmpRelay {
         };
 
         // Policy check.
-        if platform_policy.is_some_and(|platform| {
-            platform
-                .evaluate_egress_ip(IpAddr::V6(dst_ip), Protocol::Icmpv6, &self.shared)
-                .is_deny()
-        }) || policy
-            .evaluate_egress_ip(IpAddr::V6(dst_ip), Protocol::Icmpv6, &self.shared)
-            .is_deny()
-        {
+        if !icmp_allowed_by_policy(
+            &self.shared,
+            policy,
+            platform_policy,
+            IpAddr::V6(dst_ip),
+            Protocol::Icmpv6,
+        ) {
             tracing::debug!(dst = %dst_ip, "ICMPv6 echo denied by policy");
             return true;
         }
@@ -293,6 +291,41 @@ impl IcmpRelay {
 
         true
     }
+}
+
+fn icmp_allowed_by_policy(
+    shared: &SharedState,
+    policy: &NetworkPolicy,
+    platform_policy: Option<&NetworkPolicy>,
+    dst: IpAddr,
+    protocol: Protocol,
+) -> bool {
+    let origin = if platform_policy
+        .is_some_and(|platform| platform.evaluate_egress_ip(dst, protocol, shared).is_deny())
+    {
+        Some("platform")
+    } else if policy.evaluate_egress_ip(dst, protocol, shared).is_deny() {
+        Some("tenant")
+    } else {
+        None
+    };
+    if let Some(origin) = origin {
+        shared.emit_policy_deny(
+            if protocol == Protocol::Icmpv4 {
+                "icmpv4"
+            } else {
+                "icmpv6"
+            },
+            "",
+            Some(dst),
+            0,
+            "packet",
+            origin,
+            "egress_policy",
+        );
+        return false;
+    }
+    true
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -838,6 +871,52 @@ fn construct_icmpv6_echo_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::sync::Mutex;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn external_icmp_policy_deny_identifies_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        let shared = SharedState::new(4);
+        shared.set_sandbox_id(Arc::<str>::from("icmp-external"));
+        let tenant = NetworkPolicy::allow_all();
+        let platform = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            assert!(!icmp_allowed_by_policy(
+                &shared,
+                &tenant,
+                Some(&platform),
+                "10.0.0.5".parse().unwrap(),
+                Protocol::Icmpv4,
+            ));
+        });
+        let mut body = String::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(row["fields"]["sandbox_id"], "icmp-external");
+        assert_eq!(row["fields"]["transport"], "icmpv4");
+        assert_eq!(row["fields"]["policy_origin"], "platform");
+    }
 
     use smoltcp::phy::ChecksumCapabilities;
 

@@ -164,6 +164,11 @@ impl HostRoutes {
 }
 
 impl SmoltcpNetwork {
+    /// Attribute future network-policy deny events to this sandbox.
+    pub fn set_sandbox_id(&self, id: Arc<str>) {
+        self.shared.set_sandbox_id(id);
+    }
+
     /// Gateway identity for an ordinary cold boot in the given host slot.
     pub fn default_gateway_mac(slot: u16) -> [u8; 6] {
         derive_gateway_mac(slot)

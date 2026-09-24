@@ -79,6 +79,9 @@ pub struct SharedState {
 
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// Immutable sandbox identity for attributing deny events on a shared host.
+    sandbox_id: OnceLock<Arc<str>>,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -122,7 +125,41 @@ impl SharedState {
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            sandbox_id: OnceLock::new(),
         }
+    }
+
+    /// Stamp the network state with its sandbox ID before processing traffic.
+    pub fn set_sandbox_id(&self, id: Arc<str>) {
+        let _ = self.sandbox_id.set(id);
+    }
+
+    /// Emit the stable JSONL fields consumed by host-side policy-deny observers.
+    /// The network decision is already made by the caller; this never changes it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_policy_deny(
+        &self,
+        transport: &'static str,
+        host: &str,
+        ip: Option<IpAddr>,
+        port: u16,
+        source: &'static str,
+        policy_origin: &'static str,
+        reason: &'static str,
+    ) {
+        let ip = ip.map(|value| value.to_string()).unwrap_or_default();
+        tracing::debug!(
+            target: "policy_deny",
+            transport,
+            host,
+            ip,
+            port,
+            source,
+            sandbox_id = self.sandbox_id.get().map_or("", |id| id.as_ref()),
+            policy_origin,
+            reason,
+            "network policy denied egress",
+        );
     }
 
     /// Set the per-sandbox gateway IPs. Called once at boot. Each family is
@@ -271,6 +308,56 @@ pub(crate) fn normalize_hostname(domain: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn policy_deny_event_identifies_sandbox_and_policy_without_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        let shared = SharedState::new(DEFAULT_QUEUE_CAPACITY);
+        shared.set_sandbox_id(Arc::<str>::from("sandbox-a"));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            shared.emit_policy_deny(
+                "tcp",
+                "",
+                Some("169.254.169.254".parse().unwrap()),
+                80,
+                "packet",
+                "platform",
+                "egress_policy",
+            );
+        });
+
+        let mut body = String::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(row["target"], "policy_deny");
+        assert_eq!(row["fields"]["sandbox_id"], "sandbox-a");
+        assert_eq!(row["fields"]["transport"], "tcp");
+        assert_eq!(row["fields"]["ip"], "169.254.169.254");
+        assert_eq!(row["fields"]["port"], 80);
+        assert_eq!(row["fields"]["policy_origin"], "platform");
+        assert_eq!(row["fields"]["reason"], "egress_policy");
+    }
 
     #[test]
     fn shared_state_queue_push_pop() {
