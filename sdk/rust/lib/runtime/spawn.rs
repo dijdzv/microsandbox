@@ -64,6 +64,8 @@ use microsandbox_runtime::vm::{MetricsSlotHandoff, StartupCommand};
 use microsandbox_types::SandboxLogLevel;
 use microsandbox_utils::{DB_FILENAME, DB_SUBDIR};
 
+#[cfg(feature = "net")]
+use super::network_slot::NetworkSlot;
 use crate::runtime::handle::ProcessHandle;
 #[cfg(windows)]
 use crate::runtime::handle::WindowsJob;
@@ -392,6 +394,17 @@ pub async fn spawn_sandbox(
     #[cfg(windows)]
     let startup_pipe_name = startup_pipe.as_ref().map(|pipe| pipe.name.as_os_str());
 
+    // The durable sandbox ID grows forever; network addresses use a bounded
+    // lease held only while this run is active.
+    #[cfg(feature = "net")]
+    let network_slot = match NetworkSlot::lease(local, sandbox_id).await {
+        Ok(slot) => slot,
+        Err(err) => {
+            release_metrics_reservation(config, metrics_reservation.as_ref());
+            return Err(err);
+        }
+    };
+
     // Split the config: `visible` stays on argv, the typed `LaunchConfig` is
     // delivered over the config fd (keeps the network-config blob and
     // secret-bearing env off `ps` / `/proc/<pid>/cmdline` — see issue #997).
@@ -399,6 +412,8 @@ pub async fn spawn_sandbox(
         local,
         config,
         sandbox_id,
+        #[cfg(feature = "net")]
+        network_slot,
         &db_path,
         global.database.connect_timeout_secs,
         &log_dir,
@@ -2035,6 +2050,7 @@ fn sandbox_cli_args(
     local: &LocalBackend,
     config: &SandboxConfig,
     sandbox_id: i32,
+    #[cfg(feature = "net")] network_slot: NetworkSlot,
     db_path: &Path,
     db_connect_timeout_secs: u64,
     log_dir: &Path,
@@ -2330,7 +2346,7 @@ fn sandbox_cli_args(
                 .local_network_config()
                 .expect("sandbox network spec should decode to local network config"),
         );
-        launch.sandbox_slot = sandbox_id as u64;
+        launch.sandbox_slot = u64::from(network_slot.get());
     }
 
     for var in &config.spec.env {
@@ -2459,6 +2475,8 @@ mod tests {
 
     use microsandbox_runtime::launch::LaunchConfig;
 
+    #[cfg(feature = "net")]
+    use super::super::network_slot::NetworkSlot;
     use super::sandbox_cli_args;
     use crate::{
         LogLevel,
@@ -2536,6 +2554,11 @@ mod tests {
     /// touches.
     fn test_local_backend() -> LocalBackend {
         LocalBackend::lazy()
+    }
+
+    #[cfg(feature = "net")]
+    fn test_network_slot() -> NetworkSlot {
+        NetworkSlot::try_from(1).unwrap()
     }
 
     /// Re-expand a [`LaunchConfig`] into the historical `--flag value` token
@@ -2643,6 +2666,36 @@ mod tests {
         render_args_with_named_volumes(config, &HashMap::new())
     }
 
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn high_database_id_does_not_become_a_network_slot() {
+        let config = SandboxBuilder::new("slot-boundary")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        let local = test_local_backend();
+        let (_, launch) = sandbox_cli_args(
+            &local,
+            &config,
+            65_684,
+            test_network_slot(),
+            Path::new("/tmp/msb.db"),
+            30,
+            Path::new("/tmp/logs"),
+            Path::new("/tmp/runtime"),
+            Path::new("/tmp/agent.sock"),
+            Path::new("/tmp/libkrunfw.dylib"),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(launch.sandbox_slot, 1);
+    }
+
     fn render_args_with_named_volumes(
         config: &SandboxConfig,
         named_volumes: &HashMap<String, super::ResolvedNamedVolume>,
@@ -2652,6 +2705,8 @@ mod tests {
             &local,
             config,
             42,
+            #[cfg(feature = "net")]
+            test_network_slot(),
             Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
@@ -2741,6 +2796,8 @@ mod tests {
             &local,
             config,
             42,
+            #[cfg(feature = "net")]
+            test_network_slot(),
             Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
@@ -2774,6 +2831,8 @@ mod tests {
             &local,
             config,
             42,
+            #[cfg(feature = "net")]
+            test_network_slot(),
             Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
@@ -2856,6 +2915,8 @@ mod tests {
             &local,
             &config,
             42,
+            #[cfg(feature = "net")]
+            test_network_slot(),
             Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
@@ -2914,6 +2975,8 @@ mod tests {
             &local,
             &config,
             42,
+            #[cfg(feature = "net")]
+            test_network_slot(),
             Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),

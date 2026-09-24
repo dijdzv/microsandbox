@@ -21,6 +21,9 @@ pub const MAINTENANCE_LEASE_MIGRATION_ID: &str = "m20260621_000002_create_mainte
 /// Migration that introduced desired-vs-active sandbox config tracking.
 pub const ACTIVE_CONFIG_MIGRATION_ID: &str = "m20260703_000001_add_sandbox_active_config";
 
+/// Migration that introduces bounded, recyclable network slots.
+pub const NETWORK_SLOT_MIGRATION_ID: &str = "m20260818_000001_sandbox_network_slot";
+
 /// Frozen migration baseline for the transitional 0.6.0 release.
 ///
 /// The released 0.6.0 binary predates `msb __schema-baseline --json`, so
@@ -142,6 +145,15 @@ pub const MIGRATION_METADATA: &[MigrationMetadata] = &[
         affects_cache: false,
         affects_user_data: false,
         summary: "remove active sandbox config snapshots",
+    },
+    MigrationMetadata {
+        id: NETWORK_SLOT_MIGRATION_ID,
+        // Older binaries ignore the retained SQLite column after down()
+        // removes this migration record; up() is idempotent on re-upgrade.
+        reversible: true,
+        affects_cache: false,
+        affects_user_data: false,
+        summary: "leave the network-slot column inert for older binaries",
     },
 ];
 

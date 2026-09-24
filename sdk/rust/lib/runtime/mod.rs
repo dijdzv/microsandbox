@@ -5,6 +5,8 @@
 //! [`crate::sandbox::SandboxConfig`].
 
 pub(crate) mod handle;
+#[cfg(feature = "net")]
+pub(crate) mod network_slot;
 pub(crate) mod spawn;
 
 //--------------------------------------------------------------------------------------------------

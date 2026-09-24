@@ -10,6 +10,11 @@ All sandbox traffic flows through a host-controlled networking stack. From insid
 
 By default, sandboxes can reach the public internet but cannot reach private networks, loopback, link-local addresses, or cloud metadata endpoints. Inbound traffic is only reachable through published ports.
 
+The VM's private IP and MAC address are leased while it runs. They do not
+identify a sandbox permanently: after a stop and restart, it may receive a
+different address. Use published ports or the supported host connection rather
+than saving the guest address for later runs.
+
 To turn networking off entirely:
 
 <CodeGroup>

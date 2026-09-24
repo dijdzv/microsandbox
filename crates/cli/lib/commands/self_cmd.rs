@@ -2464,8 +2464,19 @@ mod tests {
 
         rollback_schema(db.inner(), 1).await.unwrap();
 
-        // The latest migration adds `sandbox.active_config`; rolling back one
-        // step must drop the column while leaving older tables intact.
+        // The latest migration leaves network_slot in place on rollback for
+        // SQLite compatibility, but removes its migration record. The next
+        // rollback removes the older active_config column.
+        let rows = db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT version FROM seaql_migrations WHERE version = 'm20260818_000001_sandbox_network_slot'",
+            ))
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+
+        rollback_schema(db.inner(), 1).await.unwrap();
         let rows = db
             .query_all(Statement::from_string(
                 DatabaseBackend::Sqlite,

@@ -239,6 +239,7 @@ mod tests {
             name: Set("s1".to_string()),
             config: Set("{}".to_string()),
             active_config: Set(None),
+            network_slot: Set(None),
             status: Set(sandbox::SandboxStatus::Running),
             ephemeral: Set(false),
             created_at: Set(None),

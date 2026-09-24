@@ -57,6 +57,8 @@ pub struct Model {
     pub config: String,
     /// Configuration actually used by the currently running VM, when active.
     pub active_config: Option<String>,
+    /// Bounded network address-pool slot held only while the run is active.
+    pub network_slot: Option<u16>,
     pub status: SandboxStatus,
     /// Denormalized copy of `config.policy.ephemeral`.
     ///

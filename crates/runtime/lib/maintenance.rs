@@ -632,10 +632,12 @@ async fn reconcile_stale_active(
 
     // No active run yet while Running means the sandbox is still starting
     // (its runtime has not inserted a run row). Draining with no active run
-    // means the stop request already reached a terminal run state, so repair
-    // the sandbox status instead of leaving future stop callers polling.
+    // is terminal only when no network slot is leased: the VM may still be
+    // starting and have its address before its PID row appears.
     let Some(run) = run else {
-        if sandbox.status == sandbox_entity::SandboxStatus::Draining {
+        if sandbox.status == sandbox_entity::SandboxStatus::Draining
+            && sandbox.network_slot.is_none()
+        {
             let now = chrono::Utc::now().naive_utc();
             let (terminal_status, _) = stale_runtime_terminal_state(sandbox.status);
             let result = sandbox_entity::Entity::update_many()
@@ -644,9 +646,14 @@ async fn reconcile_stale_active(
                     sandbox_entity::Column::ActiveConfig,
                     Expr::value(Option::<String>::None),
                 )
+                .col_expr(
+                    sandbox_entity::Column::NetworkSlot,
+                    Expr::value(Option::<u16>::None),
+                )
                 .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
                 .filter(sandbox_entity::Column::Id.eq(sandbox.id))
                 .filter(sandbox_entity::Column::Status.eq(sandbox_entity::SandboxStatus::Draining))
+                .filter(sandbox_entity::Column::NetworkSlot.is_null())
                 .exec(db)
                 .await?;
             return Ok(result.rows_affected > 0);
@@ -688,6 +695,10 @@ async fn reconcile_stale_active(
         .col_expr(
             sandbox_entity::Column::ActiveConfig,
             Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            sandbox_entity::Column::NetworkSlot,
+            Expr::value(Option::<u16>::None),
         )
         .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
         .filter(sandbox_entity::Column::Id.eq(sandbox.id))
@@ -1090,5 +1101,39 @@ mod tests {
         );
         assert!(status_of(&db, eph).await.is_none());
         assert!(!dir.path().join("eph").exists());
+    }
+
+    #[tokio::test]
+    async fn sweep_retains_draining_slot_without_a_recorded_pid() {
+        let (dir, db) = test_db().await;
+        let id = insert_sandbox(
+            &db,
+            "draining-leased",
+            sandbox_entity::SandboxStatus::Draining,
+            false,
+        )
+        .await;
+        sandbox_entity::Entity::update_many()
+            .col_expr(
+                sandbox_entity::Column::NetworkSlot,
+                Expr::value(Some(14_u16)),
+            )
+            .filter(sandbox_entity::Column::Id.eq(id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let report =
+            run_sandbox_lifecycle_maintenance(&db, dir.path(), MaintenanceLimits::default())
+                .await
+                .unwrap();
+        assert_eq!(report.reconciled, 0);
+        let retained = sandbox_entity::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, sandbox_entity::SandboxStatus::Draining);
+        assert_eq!(retained.network_slot, Some(14));
     }
 }

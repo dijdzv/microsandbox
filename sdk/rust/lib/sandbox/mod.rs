@@ -668,15 +668,17 @@ pub(crate) async fn create_local(
     let (local_state, returned_config) =
         match create_inner_local(local_backend, config, sandbox_id, mode).await {
             Ok(pair) => pair,
-            Err(e) => {
-                if created_named_volumes.is_empty() {
-                    let _ =
-                        update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
-                } else {
-                    rollback_created_named_volumes(local_backend, &created_named_volumes).await;
-                    let _ = delete_sandbox_record(write_db, sandbox_id).await;
+            Err(failure) => {
+                if failure.process_terminated {
+                    if created_named_volumes.is_empty() {
+                        let _ = update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped)
+                            .await;
+                    } else {
+                        rollback_created_named_volumes(local_backend, &created_named_volumes).await;
+                        let _ = delete_sandbox_record(write_db, sandbox_id).await;
+                    }
                 }
-                return Err(e);
+                return Err(failure.error);
             }
         };
     let sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
@@ -807,10 +809,33 @@ pub(crate) async fn start_local(
             }
             Ok(sandbox)
         }
-        Err(err) => {
-            let _ = update_sandbox_status(write_db, model.id, SandboxStatus::Stopped).await;
-            Err(err)
+        Err(failure) => {
+            if failure.process_terminated {
+                let _ = update_sandbox_status(write_db, model.id, SandboxStatus::Stopped).await;
+            }
+            Err(failure.error)
         }
+    }
+}
+
+struct CreateInnerFailure {
+    error: crate::MicrosandboxError,
+    process_terminated: bool,
+}
+
+async fn stop_failed_relay_process(handle: &mut ProcessHandle) -> MicrosandboxResult<()> {
+    if handle.try_wait()?.is_none() {
+        // A failed relay handshake is not proof that the VM has exited. Keep
+        // its network lease until the child is confirmed reaped.
+        let _ = handle.kill();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(crate::MicrosandboxError::Runtime(format!(
+            "sandbox process {} did not exit after failed relay startup",
+            handle.pid(),
+        ))),
     }
 }
 
@@ -821,12 +846,34 @@ async fn create_inner_local(
     config: SandboxConfig,
     sandbox_id: i32,
     mode: SpawnMode,
-) -> MicrosandboxResult<(crate::backend::SandboxLocalState, SandboxConfig)> {
-    let (mut handle, agent_sock_path) = spawn_sandbox(local, &config, sandbox_id, mode).await?;
+) -> Result<(crate::backend::SandboxLocalState, SandboxConfig), CreateInnerFailure> {
+    let (mut handle, agent_sock_path) = spawn_sandbox(local, &config, sandbox_id, mode)
+        .await
+        .map_err(|error| CreateInnerFailure {
+            error,
+            process_terminated: true,
+        })?;
     let log_dir = local.sandboxes_dir().join(&config.spec.name).join("logs");
 
     // Wait for the relay socket to become available.
-    let client = wait_for_relay(&agent_sock_path, &log_dir, &mut handle, &config.spec.name).await?;
+    let client =
+        match wait_for_relay(&agent_sock_path, &log_dir, &mut handle, &config.spec.name).await {
+            Ok(client) => client,
+            Err(error) => {
+                return Err(match stop_failed_relay_process(&mut handle).await {
+                    Ok(()) => CreateInnerFailure {
+                        error,
+                        process_terminated: true,
+                    },
+                    Err(cleanup_error) => CreateInnerFailure {
+                        error: crate::MicrosandboxError::Runtime(format!(
+                            "{error}; failed to confirm sandbox process exit: {cleanup_error}"
+                        )),
+                        process_terminated: false,
+                    },
+                });
+            }
+        };
 
     if let Ok(ready) = client.ready() {
         tracing::info!(
@@ -990,6 +1037,11 @@ pub(crate) async fn kill_local(
     if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
         kill_pid(pid)?;
         pids.push(pid);
+    }
+    if pids.is_empty() && model.network_slot.is_some() {
+        return Err(crate::MicrosandboxError::Runtime(format!(
+            "sandbox {name} has a network slot but no confirmed dead process"
+        )));
     }
 
     if !pids.is_empty() {
@@ -2091,6 +2143,10 @@ pub(super) async fn update_sandbox_status(
                 sandbox_entity::Column::ActiveConfig,
                 Expr::value(Option::<String>::None),
             );
+            update = update.col_expr(
+                sandbox_entity::Column::NetworkSlot,
+                Expr::value(Option::<u16>::None),
+            );
         }
         update
             .filter(sandbox_entity::Column::Id.eq(sandbox_id))
@@ -2183,12 +2239,10 @@ pub(super) async fn reconcile_sandbox_runtime_state(
 
     let run = load_active_run(pools.read(), sandbox.id).await?;
 
-    // No run record yet while Running means the sandbox is still starting up
-    // (the child process has not inserted its PID). A Draining row with no
-    // active run, however, has already completed shutdown from the DB's point
-    // of view and should not keep stop callers polling forever.
+    // A process can hold a network slot before its PID/run record appears.
+    // Draining without a run is terminal only when no slot is leased.
     let Some(run) = run else {
-        if sandbox.status == SandboxStatus::Draining {
+        if sandbox.status == SandboxStatus::Draining && sandbox.network_slot.is_none() {
             let (terminal_status, reason) = stale_runtime_terminal_state(sandbox.status);
             mark_sandbox_runtime_stale(pools.write(), sandbox.id, None, terminal_status, reason)
                 .await?;
@@ -2311,20 +2365,26 @@ async fn mark_sandbox_runtime_stale(
 
         // Only reconcile an active row. This prevents a concurrent start()
         // from having its newly-terminal or newly-running status overwritten.
-        sandbox_entity::Entity::update_many()
+        let mut sandbox_update = sandbox_entity::Entity::update_many()
             .col_expr(sandbox_entity::Column::Status, Expr::value(terminal_status))
             .col_expr(
                 sandbox_entity::Column::ActiveConfig,
                 Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                sandbox_entity::Column::NetworkSlot,
+                Expr::value(Option::<u16>::None),
             )
             .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
             .filter(sandbox_entity::Column::Id.eq(sandbox_id))
             .filter(
                 sandbox_entity::Column::Status
                     .is_in([SandboxStatus::Running, SandboxStatus::Draining]),
-            )
-            .exec(&txn)
-            .await?;
+            );
+        if run_id.is_none() {
+            sandbox_update = sandbox_update.filter(sandbox_entity::Column::NetworkSlot.is_null());
+        }
+        sandbox_update.exec(&txn).await?;
 
         Ok((txn, ()))
     })
@@ -2665,11 +2725,8 @@ async fn prepare_create_target(
 /// Stop the prior sandbox before recreating it.
 ///
 /// Sends SIGTERM with the configured grace, then escalates to SIGKILL
-/// and waits a short reap window. Single path for both same-process and
-/// foreign-process owners: SIGKILL bypasses any signal handler so the
-/// process is dead within kernel time, and the reap completes via the
-/// owning process's existing wait machinery (tokio's SIGCHLD driver
-/// when we're the parent, or the foreign parent's own `waitpid`).
+/// and confirms exit before releasing the network slot. A signal request
+/// alone does not prove that the old VM has stopped using its address.
 /// Replaces the previous "wait 30s and give up" behavior, which spun
 /// the full timeout when libkrun's SIGTERM handler did a slow
 /// graceful shutdown.
@@ -2679,6 +2736,15 @@ async fn stop_sandbox_for_replacement(
     grace: std::time::Duration,
 ) -> MicrosandboxResult<()> {
     let run = load_active_run(pools.read(), sandbox.id).await?;
+    if run.is_none() && sandbox.network_slot.is_some() {
+        // Startup can lease a slot before its runtime run row appears. With
+        // no PID to inspect, replacing this row could assign the live VM's
+        // address to a second process.
+        return Err(crate::MicrosandboxError::Runtime(format!(
+            "sandbox {} has a network slot but no process record; replacement cannot confirm exit",
+            sandbox.id,
+        )));
+    }
     let pids: Vec<i32> = run
         .as_ref()
         .and_then(|model| model.pid)
@@ -2695,23 +2761,18 @@ async fn stop_sandbox_for_replacement(
             wait_for_pids_to_exit(&pids, grace).await;
         }
 
-        // SIGKILL anything still alive. We don't wait or verify after
-        // SIGKILL: it's uncatchable, so termination is bounded by kernel
-        // time, and the only state that would have us spin is the
-        // zombie window between exit and the parent's `waitpid`. That
-        // window is harmless: prepare_create_target wipes the DB row
-        // and the sandbox dir, the new spawn gets a fresh PID, and the
-        // zombie reaps on its own (tokio's SIGCHLD driver when we own
-        // it, or the foreign parent's wait machinery otherwise).
+        // Do not release the lease until every old process is dead or reaped.
         for pid in pids.iter().copied().filter(|p| pid_is_alive(*p)) {
             let _ = kill_pid(pid);
         }
+        wait_for_pids_to_exit(&pids, std::time::Duration::from_secs(5)).await;
     }
 
     mark_sandbox_stopped_for_replacement(
         pools.write(),
         sandbox.id,
         run.as_ref().map(|model| model.id),
+        &pids,
     )
     .await
 }
@@ -2720,7 +2781,13 @@ async fn mark_sandbox_stopped_for_replacement(
     db: &DbWriteConnection,
     sandbox_id: i32,
     run_id: Option<i32>,
+    prior_pids: &[i32],
 ) -> MicrosandboxResult<()> {
+    if prior_pids.iter().any(|pid| !pid_is_dead_or_reaped(*pid)) {
+        return Err(crate::MicrosandboxError::Runtime(format!(
+            "sandbox {sandbox_id} is still running; network slot remains leased"
+        )));
+    }
     db.transaction(|txn| async move {
         let now = chrono::Utc::now().naive_utc();
 
@@ -2745,6 +2812,10 @@ async fn mark_sandbox_stopped_for_replacement(
                 sandbox_entity::Column::Status,
                 Expr::value(SandboxStatus::Stopped),
             )
+            .col_expr(
+                sandbox_entity::Column::NetworkSlot,
+                Expr::value(Option::<u16>::None),
+            )
             .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
             .filter(sandbox_entity::Column::Id.eq(sandbox_id))
             .exec(&txn)
@@ -2760,7 +2831,7 @@ async fn wait_for_pids_to_exit(pids: &[i32], timeout: std::time::Duration) {
     let poll_interval = std::time::Duration::from_millis(50);
 
     loop {
-        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+        if pids.iter().all(|pid| pid_is_dead_or_reaped(*pid)) {
             return;
         }
 
@@ -3488,6 +3559,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_status_releases_network_slot_without_deleting_sandbox() {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+        let sandbox_id = insert_sandbox_record(pools.write(), &test_config("slot-release"))
+            .await
+            .unwrap();
+        super::sandbox_entity::Entity::update_many()
+            .col_expr(
+                super::sandbox_entity::Column::NetworkSlot,
+                sea_orm::sea_query::Expr::value(Some(11_u16)),
+            )
+            .filter(super::sandbox_entity::Column::Id.eq(sandbox_id))
+            .exec(pools.write())
+            .await
+            .unwrap();
+
+        super::update_sandbox_status(pools.write(), sandbox_id, super::SandboxStatus::Stopped)
+            .await
+            .unwrap();
+
+        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox.status, super::SandboxStatus::Stopped);
+        assert_eq!(sandbox.network_slot, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn failed_relay_start_reaps_child_before_slot_can_be_released() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut handle = crate::runtime::ProcessHandle::new(
+            pid,
+            "failed-relay".into(),
+            child,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+
+        super::stop_failed_relay_process(&mut handle).await.unwrap();
+        assert!(handle.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replacement_does_not_release_network_slot_while_prior_pid_is_alive() {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+        let sandbox_id = insert_sandbox_record(pools.write(), &test_config("live-slot"))
+            .await
+            .unwrap();
+        super::sandbox_entity::Entity::update_many()
+            .col_expr(
+                super::sandbox_entity::Column::NetworkSlot,
+                sea_orm::sea_query::Expr::value(Some(12_u16)),
+            )
+            .filter(super::sandbox_entity::Column::Id.eq(sandbox_id))
+            .exec(pools.write())
+            .await
+            .unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+
+        let result =
+            super::mark_sandbox_stopped_for_replacement(pools.write(), sandbox_id, None, &[pid])
+                .await;
+        assert!(result.is_err());
+        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox.network_slot, Some(12));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_keeps_starting_sandbox_slot_when_no_pid_is_recorded_yet() {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+        let sandbox_id = insert_sandbox_record(pools.write(), &test_config("starting-slot"))
+            .await
+            .unwrap();
+        super::sandbox_entity::Entity::update_many()
+            .col_expr(
+                super::sandbox_entity::Column::NetworkSlot,
+                sea_orm::sea_query::Expr::value(Some(13_u16)),
+            )
+            .filter(super::sandbox_entity::Column::Id.eq(sandbox_id))
+            .exec(pools.write())
+            .await
+            .unwrap();
+        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result =
+            super::stop_sandbox_for_replacement(&pools, &sandbox, std::time::Duration::ZERO).await;
+        assert!(result.is_err());
+        let retained = super::sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.network_slot, Some(13));
+    }
+
+    #[tokio::test]
     async fn test_prepare_create_target_rejects_existing_state_without_force() {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("test.db");
@@ -3649,6 +3840,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(reconciled.status, SandboxStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn draining_without_pid_keeps_a_leased_network_slot() {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+        let sandbox_id = insert_sandbox_record(pools.write(), &test_config("draining-slot"))
+            .await
+            .unwrap();
+        super::sandbox_entity::Entity::update_many()
+            .col_expr(
+                super::sandbox_entity::Column::NetworkSlot,
+                sea_orm::sea_query::Expr::value(Some(14_u16)),
+            )
+            .col_expr(
+                super::sandbox_entity::Column::Status,
+                sea_orm::sea_query::Expr::value(SandboxStatus::Draining),
+            )
+            .filter(super::sandbox_entity::Column::Id.eq(sandbox_id))
+            .exec(pools.write())
+            .await
+            .unwrap();
+        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let reconciled = reconcile_sandbox_runtime_state(&pools, sandbox)
+            .await
+            .unwrap();
+        assert_eq!(reconciled.status, SandboxStatus::Draining);
+        assert_eq!(reconciled.network_slot, Some(14));
     }
 
     #[tokio::test]
