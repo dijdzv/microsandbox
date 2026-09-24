@@ -19,6 +19,8 @@ export LD_LIBRARY_PATH="$test_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MSB_AGENTD_PATH="$agentd"
 name="orbit-deny-smoke-$$"
 second_name="orbit-deny-isolation-$$"
+platform_name="orbit-deny-platform-$$"
+hostname_name="orbit-deny-hostname-$$"
 
 cleanup() {
   local result=$?
@@ -26,9 +28,13 @@ cleanup() {
   set +e
   "$msb" stop "$name" >/dev/null 2>&1
   "$msb" stop "$second_name" >/dev/null 2>&1
+  "$msb" stop "$platform_name" >/dev/null 2>&1
+  "$msb" stop "$hostname_name" >/dev/null 2>&1
   if [[ $result -eq 0 ]]; then
     "$msb" remove "$name" >/dev/null 2>&1
     "$msb" remove "$second_name" >/dev/null 2>&1
+    "$msb" remove "$platform_name" >/dev/null 2>&1
+    "$msb" remove "$hostname_name" >/dev/null 2>&1
     gio trash "$test_dir" || printf 'test data retained: %s\n' "$test_dir" >&2
   else
     printf 'test failed; isolated diagnostics retained: %s\n' "$test_dir" >&2
@@ -77,5 +83,24 @@ second_id=$(jq -r '.fields.sandbox_id' "$test_dir/deny-second.jsonl" | head -1)
 [[ -n "$first_id" && -n "$second_id" && "$first_id" != "$second_id" ]]
 jq -es --arg ip '203.0.113.55' 'all(.[]; .fields.ip != $ip)' "$test_dir/deny.jsonl"
 
-printf 'policy-deny JSONL passed: %s + %s isolated events\n' \
-  "$(wc -l < "$test_dir/deny.jsonl")" "$(wc -l < "$test_dir/deny-second.jsonl")"
+# A tenant-wide allow cannot override the host-owned multi-tenant floor.
+MSB_DENY_LOG_PATH="$test_dir/deny-platform.jsonl" "$msb" create \
+  --name "$platform_name" --memory 512M --cpus 1 --max-duration 2m \
+  --deployment-profile multi-tenant --net all alpine
+"$msb" exec --no-tty --timeout 15s "$platform_name" -- /bin/sh -c \
+  'wget -T 2 -O - http://10.1.2.3:80/ >/dev/null 2>&1 || true'
+jq -es 'any(.[]; .fields.transport == "tcp" and .fields.ip == "10.1.2.3" and
+  .fields.policy_origin == "platform")' "$test_dir/deny-platform.jsonl"
+
+# A domain rule should be attributed to the tenant with the requested SNI.
+MSB_DENY_LOG_PATH="$test_dir/deny-hostname.jsonl" "$msb" create \
+  --name "$hostname_name" --memory 512M --cpus 1 --max-duration 2m \
+  --net-default allow --net-rule allow@dns --net-rule deny@example.com alpine
+"$msb" exec --no-tty --timeout 20s "$hostname_name" -- /bin/sh -c \
+  'wget -T 5 -O - https://example.com/ >/dev/null 2>&1 || true'
+jq -es 'any(.[]; .fields.transport == "tcp" and .fields.host == "example.com" and
+  .fields.source == "sni" and .fields.policy_origin == "tenant" and
+  .fields.reason == "domain_policy")' \
+  "$test_dir/deny-hostname.jsonl"
+
+printf 'policy-deny JSONL passed: direct, isolation, platform, hostname\n'
