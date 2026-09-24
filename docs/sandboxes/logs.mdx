@@ -127,6 +127,17 @@ Sandbox logs live under `<sandbox-dir>/logs/`:
 | `kernel.log` | Guest kernel and agent console output |
 | `boot-error.json` | Structured startup failure details, when boot fails early |
 
+## Local policy-deny events (Orbit fork)
+
+The Orbit fork can write network-policy denials as JSON Lines when the sandbox
+runtime receives `MSB_DENY_LOG_PATH`. Set a distinct path for each sandbox; the
+file is created with mode `0600` on Unix. If the path cannot be opened, startup
+fails instead of running with policy-deny observation silently disabled. The
+record contains `sandbox_id`, transport, destination host/IP and port, policy
+origin (`tenant` or `platform`), and a short reason. It does not include
+request bodies or secret values. This is an optional local diagnostic stream,
+not part of `msb logs` or an upstream microsandbox event API.
+
 ## Reference
 
 For exact log APIs, see [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), or [Go](/sdk/go/sandbox). For local log retrieval and follow mode, see [`msb logs`](/cli/sandbox-commands#msb-logs).

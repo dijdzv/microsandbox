@@ -307,7 +307,10 @@ fn main() {
             // The sandbox subprocess's stderr is redirected into
             // runtime.log via setup_log_capture(), so disable ANSI —
             // color escapes have nowhere useful to render.
-            log_args::init_tracing(sandbox_level, false);
+            if let Err(error) = log_args::init_tracing(sandbox_level, false) {
+                eprintln!("msb: policy-deny capture unavailable: {error}");
+                std::process::exit(1);
+            }
             if let Err(error) = microsandbox_filesystem::agentd::initialize_agentd_payload() {
                 eprintln!("msb: failed to select agentd payload: {error}");
                 std::process::exit(1);
@@ -320,7 +323,10 @@ fn main() {
             // since with_ansi(true) overrides tracing-subscriber's
             // built-in detection.
             let ansi = std::io::stderr().is_terminal() && console::colors_enabled_stderr();
-            log_args::init_tracing(log_level, ansi);
+            if let Err(error) = log_args::init_tracing(log_level, ansi) {
+                eprintln!("msb: policy-deny capture unavailable: {error}");
+                std::process::exit(1);
+            }
             match run_async_command_anyhow(command, log_level) {
                 Ok(()) => 0,
                 Err(e) => render_anyhow_error(&e),
