@@ -18,7 +18,7 @@ pub use spawn::{SpawnMode, spawn_sandbox};
 pub(crate) use spawn::{
     ensure_named_volumes, resolve_sandbox_agent_socket_path, resolve_sandbox_agent_socket_path_for,
     rollback_created_named_volumes, sandbox_agent_socket_path_candidates,
-    sandbox_agent_socket_path_candidates_for,
+    sandbox_agent_socket_path_candidates_for, spawn_sandbox_checked,
 };
 
 /// Resolve the host-side path of a sandbox's agentd relay socket by name.

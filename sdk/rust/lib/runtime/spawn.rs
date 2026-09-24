@@ -170,6 +170,13 @@ pub(crate) struct EnsuredNamedVolumes {
     _locks: Vec<File>,
 }
 
+/// Startup failure with a statement about whether the spawned child has exited.
+#[derive(Debug)]
+pub(crate) struct SpawnFailure {
+    pub(crate) error: MicrosandboxError,
+    pub(crate) process_terminated: bool,
+}
+
 /// How the sandbox process should behave relative to the creating process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpawnMode {
@@ -187,6 +194,30 @@ pub enum SpawnMode {
 impl EnsuredNamedVolumes {
     pub(crate) fn is_empty(&self) -> bool {
         self.created.is_empty()
+    }
+}
+
+impl SpawnFailure {
+    fn after_child(error: MicrosandboxError, exit: Option<std::process::ExitStatus>) -> Self {
+        Self {
+            error,
+            process_terminated: exit.is_some(),
+        }
+    }
+}
+
+impl From<MicrosandboxError> for SpawnFailure {
+    fn from(error: MicrosandboxError) -> Self {
+        Self {
+            error,
+            process_terminated: true,
+        }
+    }
+}
+
+impl From<std::io::Error> for SpawnFailure {
+    fn from(error: std::io::Error) -> Self {
+        MicrosandboxError::from(error).into()
     }
 }
 
@@ -263,6 +294,18 @@ pub async fn spawn_sandbox(
     sandbox_id: i32,
     mode: SpawnMode,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
+    spawn_sandbox_checked(local, config, sandbox_id, mode)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// Internal startup path that preserves whether a failed child was reaped.
+pub(crate) async fn spawn_sandbox_checked(
+    local: &LocalBackend,
+    config: &SandboxConfig,
+    sandbox_id: i32,
+    mode: SpawnMode,
+) -> Result<(ProcessHandle, PathBuf), SpawnFailure> {
     // Reference-model secrets store only a host-side source reference in the
     // durable config; resolve the actual values now so they travel to the
     // sandbox process on the private launch-config fd without ever being
@@ -344,7 +387,7 @@ pub async fn spawn_sandbox(
             Ok(pipe) => Some(pipe),
             Err(err) => {
                 release_metrics_reservation(config, metrics_reservation.as_ref());
-                return Err(err);
+                return Err(err.into());
             }
         },
         SpawnMode::Detached => None,
@@ -360,7 +403,7 @@ pub async fn spawn_sandbox(
             Ok(pipe) => Some(pipe),
             Err(err) => {
                 release_metrics_reservation(config, metrics_reservation.as_ref());
-                return Err(err);
+                return Err(err.into());
             }
         },
     };
@@ -372,7 +415,7 @@ pub async fn spawn_sandbox(
             Ok(pipe) => Some(pipe),
             Err(err) => {
                 release_metrics_reservation(config, metrics_reservation.as_ref());
-                return Err(err);
+                return Err(err.into());
             }
         },
     };
@@ -385,7 +428,8 @@ pub async fn spawn_sandbox(
                 release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(crate::MicrosandboxError::Runtime(format!(
                     "failed to create Windows sandbox job: {err}"
-                )));
+                ))
+                .into());
             }
         },
         SpawnMode::Detached => None,
@@ -401,7 +445,7 @@ pub async fn spawn_sandbox(
         Ok(slot) => slot,
         Err(err) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -443,7 +487,7 @@ pub async fn spawn_sandbox(
         Ok(file) => file,
         Err(err) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(err);
+            return Err(err.into());
         }
     };
     #[cfg(unix)]
@@ -465,7 +509,7 @@ pub async fn spawn_sandbox(
         }
         Err(err) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -580,7 +624,8 @@ pub async fn spawn_sandbox(
             release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(crate::MicrosandboxError::Runtime(
                 "sandbox process exited immediately".into(),
-            ));
+            )
+            .into());
         }
     };
     tracing::debug!(pid = _pid, sandbox = %config.spec.name, "spawn_sandbox: process started");
@@ -591,9 +636,12 @@ pub async fn spawn_sandbox(
     {
         let status = terminate_startup_process(&mut child).await;
         release_metrics_reservation(config, metrics_reservation.as_ref());
-        return Err(crate::MicrosandboxError::Runtime(format!(
-            "failed to assign sandbox process to Windows job (status: {status:?}): {err}"
-        )));
+        return Err(SpawnFailure::after_child(
+            crate::MicrosandboxError::Runtime(format!(
+                "failed to assign sandbox process to Windows job (status: {status:?}): {err}"
+            )),
+            status,
+        ));
     }
 
     let line = match tokio::time::timeout(
@@ -604,15 +652,18 @@ pub async fn spawn_sandbox(
     {
         Ok(Ok(line)) => line,
         Ok(Err(err)) => {
-            terminate_startup_process(&mut child).await;
+            let status = terminate_startup_process(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(err);
+            return Err(SpawnFailure::after_child(err, status));
         }
         Err(_) => {
-            terminate_startup_process(&mut child).await;
+            let status = terminate_startup_process(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(crate::MicrosandboxError::Runtime(
-                "sandbox startup timeout: no JSON received within 30 seconds".into(),
+            return Err(SpawnFailure::after_child(
+                crate::MicrosandboxError::Runtime(
+                    "sandbox startup timeout: no JSON received within 30 seconds".into(),
+                ),
+                status,
             ));
         }
     };
@@ -627,20 +678,26 @@ pub async fn spawn_sandbox(
                 exit_status = ?status,
                 "spawn_sandbox: failed to parse startup JSON"
             );
-            return Err(crate::MicrosandboxError::Runtime(format!(
-                "sandbox process exited ({status:?}) before sending startup info \
+            return Err(SpawnFailure::after_child(
+                crate::MicrosandboxError::Runtime(format!(
+                    "sandbox process exited ({status:?}) before sending startup info \
                  (line: {line:?}, check stderr above for details)"
-            )));
+                )),
+                status,
+            ));
         }
     };
     if startup.pid != _pid {
         let status = terminate_startup_process(&mut child).await;
         release_metrics_reservation(config, metrics_reservation.as_ref());
-        return Err(crate::MicrosandboxError::Runtime(format!(
-            "sandbox startup PID mismatch: spawned pid {_pid}, startup pid {} \
+        return Err(SpawnFailure::after_child(
+            crate::MicrosandboxError::Runtime(format!(
+                "sandbox startup PID mismatch: spawned pid {_pid}, startup pid {} \
              (status: {status:?})",
-            startup.pid
-        )));
+                startup.pid
+            )),
+            status,
+        ));
     }
 
     tracing::debug!(
@@ -1704,7 +1761,10 @@ async fn terminate_startup_process(
     child: &mut tokio::process::Child,
 ) -> Option<std::process::ExitStatus> {
     let _ = child.start_kill();
-    child.wait().await.ok()
+    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .ok()
+        .and_then(Result::ok)
 }
 
 /// Scan `config.spec.mounts` for file bind mounts and stage each file in its own
@@ -2488,6 +2548,30 @@ mod tests {
         },
         volume::VolumeKind,
     };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_failure_keeps_lease_when_child_exit_is_unconfirmed() {
+        let failure = super::SpawnFailure::after_child(
+            crate::MicrosandboxError::Runtime("startup failed".into()),
+            None,
+        );
+        assert!(!failure.process_terminated);
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let status = super::terminate_startup_process(&mut child).await;
+        assert!(status.is_some());
+        assert!(child.try_wait().unwrap().is_some());
+
+        let failure = super::SpawnFailure::after_child(
+            crate::MicrosandboxError::Runtime("startup failed".into()),
+            status,
+        );
+        assert!(failure.process_terminated);
+    }
 
     #[test]
     #[cfg(unix)]

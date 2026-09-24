@@ -58,7 +58,7 @@ use crate::{
     },
     runtime::{
         ProcessHandle, SpawnMode, ensure_named_volumes, rollback_created_named_volumes,
-        spawn_sandbox,
+        spawn_sandbox_checked,
     },
 };
 
@@ -847,11 +847,11 @@ async fn create_inner_local(
     sandbox_id: i32,
     mode: SpawnMode,
 ) -> Result<(crate::backend::SandboxLocalState, SandboxConfig), CreateInnerFailure> {
-    let (mut handle, agent_sock_path) = spawn_sandbox(local, &config, sandbox_id, mode)
+    let (mut handle, agent_sock_path) = spawn_sandbox_checked(local, &config, sandbox_id, mode)
         .await
-        .map_err(|error| CreateInnerFailure {
-            error,
-            process_terminated: true,
+        .map_err(|failure| CreateInnerFailure {
+            error: failure.error,
+            process_terminated: failure.process_terminated,
         })?;
     let log_dir = local.sandboxes_dir().join(&config.spec.name).join("logs");
 
