@@ -110,9 +110,9 @@ impl IcmpRelay {
     /// Try to intercept an outbound frame as an ICMP echo request.
     ///
     /// Returns `true` if the frame was consumed (caller should
-    /// `drop_staged_frame()`). Returns `false` if the frame is not an
-    /// ICMP echo request or the backend is unavailable — caller should
-    /// fall through to `classify_frame`.
+    /// `drop_staged_frame()`). A policy-denied echo is consumed and recorded
+    /// even if the host cannot relay ICMP. Non-echo frames and allowed echoes
+    /// without a host backend fall through to `classify_frame`.
     pub fn relay_outbound_if_echo(
         &self,
         frame: &[u8],
@@ -125,12 +125,8 @@ impl IcmpRelay {
         };
 
         match eth.ethertype() {
-            EthernetProtocol::Ipv4 if matches!(self.backend_v4, EchoBackend::Available) => {
-                self.try_relay_icmpv4(&eth, config, policy, platform_policy)
-            }
-            EthernetProtocol::Ipv6 if matches!(self.backend_v6, EchoBackend::Available) => {
-                self.try_relay_icmpv6(&eth, config, policy, platform_policy)
-            }
+            EthernetProtocol::Ipv4 => self.try_relay_icmpv4(&eth, config, policy, platform_policy),
+            EthernetProtocol::Ipv6 => self.try_relay_icmpv6(&eth, config, policy, platform_policy),
             _ => false,
         }
     }
@@ -180,6 +176,12 @@ impl IcmpRelay {
         ) {
             tracing::debug!(dst = %dst_ip, "ICMP echo denied by policy");
             return true; // Consumed (silently dropped by policy).
+        }
+
+        // Host ICMP availability only affects relaying allowed echoes. It
+        // must not suppress a policy decision or its retained deny event.
+        if matches!(self.backend_v4, EchoBackend::Unavailable) {
+            return false;
         }
 
         let src_ip: Ipv4Addr = ipv4.src_addr();
@@ -260,6 +262,10 @@ impl IcmpRelay {
         ) {
             tracing::debug!(dst = %dst_ip, "ICMPv6 echo denied by policy");
             return true;
+        }
+
+        if matches!(self.backend_v6, EchoBackend::Unavailable) {
+            return false;
         }
 
         let src_ip: Ipv6Addr = ipv6.src_addr();
@@ -872,12 +878,187 @@ fn construct_icmpv6_echo_reply(
 mod tests {
     use super::*;
 
+    use crate::netstack::poll::GatewayIps;
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::sync::Mutex;
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::Targets;
     use tracing_subscriber::layer::SubscriberExt;
+
+    fn echo_request_v4(dst: Ipv4Addr) -> Vec<u8> {
+        let src = Ipv4Addr::new(100, 96, 0, 2);
+        let echo = Icmpv4Repr::EchoRequest {
+            ident: 1,
+            seq_no: 1,
+            data: b"probe",
+        };
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Icmp,
+            payload_len: echo.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut frame = vec![0; ETH_HDR_LEN + ip.buffer_len() + echo.buffer_len()];
+        EthernetRepr {
+            src_addr: EthernetAddress([2, 0, 0, 0, 0, 2]),
+            dst_addr: EthernetAddress([2, 0, 0, 0, 0, 1]),
+            ethertype: EthernetProtocol::Ipv4,
+        }
+        .emit(&mut EthernetFrame::new_unchecked(&mut frame));
+        ip.emit(
+            &mut Ipv4Packet::new_unchecked(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]),
+            &ChecksumCapabilities::default(),
+        );
+        echo.emit(
+            &mut Icmpv4Packet::new_unchecked(&mut frame[ETH_HDR_LEN + IPV4_HDR_LEN..]),
+            &ChecksumCapabilities::default(),
+        );
+        frame
+    }
+
+    fn echo_request_v6(dst: Ipv6Addr) -> Vec<u8> {
+        let src: Ipv6Addr = "fd42:6d73:62::2".parse().unwrap();
+        let echo = Icmpv6Repr::EchoRequest {
+            ident: 1,
+            seq_no: 1,
+            data: b"probe",
+        };
+        let mut frame = vec![0; ETH_HDR_LEN + IPV6_HDR_LEN + echo.buffer_len()];
+        EthernetRepr {
+            src_addr: EthernetAddress([2, 0, 0, 0, 0, 2]),
+            dst_addr: EthernetAddress([2, 0, 0, 0, 0, 1]),
+            ethertype: EthernetProtocol::Ipv6,
+        }
+        .emit(&mut EthernetFrame::new_unchecked(&mut frame));
+        Ipv6Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: echo.buffer_len(),
+            hop_limit: 64,
+        }
+        .emit(&mut Ipv6Packet::new_unchecked(
+            &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN],
+        ));
+        echo.emit(
+            &src,
+            &dst,
+            &mut Icmpv6Packet::new_unchecked(&mut frame[ETH_HDR_LEN + IPV6_HDR_LEN..]),
+            &ChecksumCapabilities::default(),
+        );
+        frame
+    }
+
+    fn unavailable_relay(shared: Arc<SharedState>) -> IcmpRelay {
+        IcmpRelay {
+            shared,
+            gateway_mac: EthernetAddress([2, 0, 0, 0, 0, 1]),
+            guest_mac: EthernetAddress([2, 0, 0, 0, 0, 2]),
+            tokio_handle: tokio::runtime::Handle::current(),
+            backend_v4: EchoBackend::Unavailable,
+            backend_v6: EchoBackend::Unavailable,
+        }
+    }
+
+    fn test_poll_config() -> PollLoopConfig {
+        PollLoopConfig {
+            gateway_mac: [2, 0, 0, 0, 0, 1],
+            guest_mac: [2, 0, 0, 0, 0, 2],
+            gateway: GatewayIps {
+                ipv4: Some(Ipv4Addr::new(100, 96, 0, 1)),
+                ipv6: None,
+            },
+            guest_ipv4: Some(Ipv4Addr::new(100, 96, 0, 2)),
+            guest_ipv6: None,
+            mtu: 1500,
+        }
+    }
+
+    fn record_deny_from(action: impl FnOnce() -> bool) -> (bool, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        let consumed =
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), action);
+        let body = std::fs::read_to_string(&path).unwrap();
+        (consumed, serde_json::from_str(body.trim()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_icmp_still_records_tenant_deny() {
+        let shared = Arc::new(SharedState::new(4));
+        shared.set_sandbox_id(Arc::<str>::from("icmp-unavailable"));
+        let relay = unavailable_relay(shared);
+        let frame = echo_request_v4(Ipv4Addr::new(198, 51, 100, 42));
+        let (consumed, row) = record_deny_from(|| {
+            relay.relay_outbound_if_echo(&frame, &test_poll_config(), &NetworkPolicy::none(), None)
+        });
+        assert!(consumed);
+        assert_eq!(row["fields"]["sandbox_id"], "icmp-unavailable");
+        assert_eq!(row["fields"]["ip"], "198.51.100.42");
+        assert_eq!(row["fields"]["transport"], "icmpv4");
+        assert_eq!(row["fields"]["policy_origin"], "tenant");
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_icmp_keeps_allowed_echo_fallback() {
+        let shared = Arc::new(SharedState::new(4));
+        let relay = unavailable_relay(shared);
+        let frame = echo_request_v4(Ipv4Addr::new(198, 51, 100, 42));
+        assert!(!relay.relay_outbound_if_echo(
+            &frame,
+            &test_poll_config(),
+            &NetworkPolicy::allow_all(),
+            None,
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_icmp_still_records_platform_deny() {
+        let shared = Arc::new(SharedState::new(4));
+        let relay = unavailable_relay(shared);
+        let frame = echo_request_v4(Ipv4Addr::new(10, 1, 2, 3));
+        let platform = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+        let (consumed, row) = record_deny_from(|| {
+            relay.relay_outbound_if_echo(
+                &frame,
+                &test_poll_config(),
+                &NetworkPolicy::allow_all(),
+                Some(&platform),
+            )
+        });
+        assert!(consumed);
+        assert_eq!(row["fields"]["policy_origin"], "platform");
+        assert_eq!(row["fields"]["ip"], "10.1.2.3");
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_icmpv6_still_records_tenant_deny() {
+        let shared = Arc::new(SharedState::new(4));
+        let relay = unavailable_relay(shared);
+        let dst: Ipv6Addr = "2001:db8::42".parse().unwrap();
+        let frame = echo_request_v6(dst);
+        let mut config = test_poll_config();
+        config.gateway.ipv6 = Some("fd42:6d73:62::1".parse().unwrap());
+        config.guest_ipv6 = Some("fd42:6d73:62::2".parse().unwrap());
+        let (consumed, row) = record_deny_from(|| {
+            relay.relay_outbound_if_echo(&frame, &config, &NetworkPolicy::none(), None)
+        });
+        assert!(consumed);
+        assert_eq!(row["fields"]["transport"], "icmpv6");
+        assert_eq!(row["fields"]["policy_origin"], "tenant");
+        assert_eq!(row["fields"]["ip"], "2001:db8::42");
+    }
 
     #[test]
     fn external_icmp_policy_deny_identifies_platform() {

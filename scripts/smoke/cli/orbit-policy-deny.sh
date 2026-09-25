@@ -53,12 +53,15 @@ MSB_DENY_LOG_PATH="$test_dir/deny.jsonl" "$msb" create \
   --name "$name" --memory 512M --cpus 1 --max-duration 2m \
   --no-net alpine
 
+# Guest-side values must not expand in this host shell.
+# shellcheck disable=SC2016
 "$msb" exec --no-tty --timeout 30s "$name" -- /bin/sh -c '
   nslookup blocked.example >/dev/null 2>&1 || true
   wget -T 2 -O - http://198.51.100.42:80/ >/dev/null 2>&1 || true
   printf probe | nc -u -w 1 198.51.100.42 12345 >/dev/null 2>&1 || true
   gateway=$(ip route | awk '\''/^default via/ {print $3; exit}'\'')
   ping -c 1 -W 1 "$gateway" >/dev/null 2>&1 || true
+  ping -c 1 -W 1 198.51.100.42 >/dev/null 2>&1 || true
 '
 
 jq -es '
@@ -69,6 +72,9 @@ jq -es '
   ([.[].fields.transport] | index("dns") != null and index("tcp") != null and
     index("udp") != null and index("icmpv4") != null)
 ' "$test_dir/deny.jsonl"
+jq -es 'any(.[]; .fields.transport == "icmpv4" and
+  .fields.ip == "198.51.100.42" and .fields.policy_origin == "tenant")' \
+  "$test_dir/deny.jsonl"
 
 # Two concurrent VMs must not write into one another's capture file.
 MSB_DENY_LOG_PATH="$test_dir/deny-second.jsonl" "$msb" create \
@@ -103,4 +109,4 @@ jq -es 'any(.[]; .fields.transport == "tcp" and .fields.host == "example.com" an
   .fields.reason == "domain_policy")' \
   "$test_dir/deny-hostname.jsonl"
 
-printf 'policy-deny JSONL passed: direct, isolation, platform, hostname\n'
+printf 'policy-deny JSONL passed: direct, external ICMP, isolation, platform, hostname\n'

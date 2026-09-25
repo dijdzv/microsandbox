@@ -135,8 +135,11 @@ file is created with mode `0600` on Unix. If the path cannot be opened, startup
 fails instead of running with policy-deny observation silently disabled. The
 record contains `sandbox_id`, transport, destination host/IP and port, policy
 origin (`tenant` or `platform`), and a short reason. It does not include
-request bodies or secret values. This is an optional local diagnostic stream,
-not part of `msb logs` or an upstream microsandbox event API.
+request bodies or secret values. Denied external ICMP Echo Requests are recorded
+even when the host cannot open an unprivileged ping socket; an allowed Echo
+Request still requires that host capability to be relayed. This is an optional
+local diagnostic stream, not part of `msb logs` or an upstream microsandbox
+event API.
 
 ## Reference
 
