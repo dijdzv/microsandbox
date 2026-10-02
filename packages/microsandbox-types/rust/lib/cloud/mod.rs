@@ -494,6 +494,7 @@ impl CloudSandboxSpec {
             max_tcp_connections: self.network.max_tcp_connections,
             max_udp_connections: self.network.max_udp_connections,
             rate_limiter: None,
+            nat64_prefixes: NetworkSpec::default().nat64_prefixes,
             trust_host_cas: false,
             outbound_proxy: None,
         };

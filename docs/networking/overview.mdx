@@ -11,6 +11,20 @@ All sandbox traffic flows through a host-controlled networking stack. From insid
 
 By default, sandboxes can reach the public internet but cannot reach private networks, loopback, link-local addresses, or cloud metadata endpoints. Only published ports accept inbound traffic.
 
+### NAT64 destination policy
+
+The host policy recognizes the well-known `64:ff9b::/96` NAT64 prefix by
+default, including when loading a configuration saved before this setting
+existed. Address-group and IPv4 CIDR rules also check the embedded IPv4
+destination. A domain allow rule therefore cannot override an earlier rule
+denying a translated private or metadata address. The packet destination stays
+IPv6; this setting does not provide a NAT64 translator or change routing.
+
+For a network using another translation prefix, the local CLI accepts repeatable
+`--net-nat64-prefix <IPv6-CIDR>` arguments. Only `/96` prefixes are accepted;
+additional prefixes supplement the well-known prefix. This fork backport does
+not add a corresponding language-SDK builder option.
+
 To block network access:
 
 <CodeGroup>

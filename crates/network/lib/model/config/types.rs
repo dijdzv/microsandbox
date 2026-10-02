@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
-use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig};
+use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig, WELL_KNOWN_NAT64_PREFIX};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
@@ -82,6 +82,10 @@ pub struct NetworkConfig {
     /// Egress and ingress rate limits. `None` means unlimited in both directions.
     #[serde(default)]
     pub rate_limiter: Option<NetworkRateLimiterConfig>,
+
+    /// NAT64 `/96` prefixes for policy classification.
+    #[serde(default = "default_nat64_prefixes")]
+    pub nat64_prefixes: Vec<Ipv6Network>,
 
     /// Ship the host's trusted root CAs into the guest at boot so outbound
     /// TLS works behind corporate MITM proxies (Cloudflare Warp Zero
@@ -281,6 +285,7 @@ impl Default for NetworkConfig {
             max_tcp_connections: None,
             max_udp_connections: None,
             rate_limiter: None,
+            nat64_prefixes: default_nat64_prefixes(),
             trust_host_cas: false,
             outbound_proxy: None,
         }
@@ -311,6 +316,14 @@ fn default_host_bind() -> IpAddr {
 
 fn default_query_timeout_ms() -> u64 {
     5000
+}
+
+fn default_nat64_prefixes() -> Vec<Ipv6Network> {
+    vec![
+        WELL_KNOWN_NAT64_PREFIX
+            .parse()
+            .expect("well-known NAT64 prefix must be valid"),
+    ]
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -493,6 +506,33 @@ mod tests {
     fn config_without_rate_limiter_fields_stays_unlimited() {
         let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(config.rate_limiter.is_none());
+    }
+
+    #[test]
+    fn config_without_nat64_field_defaults_to_well_known_prefix() {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let expected = vec!["64:ff9b::/96".parse().unwrap()];
+        assert_eq!(config.nat64_prefixes, expected);
+        assert_eq!(spec.nat64_prefixes, expected);
+    }
+
+    #[test]
+    fn custom_nat64_prefixes_survive_the_wire_spec_round_trip() {
+        let config = NetworkConfig {
+            nat64_prefixes: vec![
+                "64:ff9b::/96".parse().unwrap(),
+                "2001:db8:64::/96".parse().unwrap(),
+            ],
+            ..NetworkConfig::default()
+        };
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(spec.nat64_prefixes, config.nat64_prefixes);
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.nat64_prefixes, config.nat64_prefixes);
     }
 
     #[test]

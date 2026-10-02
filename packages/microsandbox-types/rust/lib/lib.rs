@@ -32,6 +32,7 @@ pub use cloud::{
 };
 #[doc(hidden)]
 pub use command::{CommandResolutionError, ResolvedCommand, resolve_default_command};
+pub use domain::WELL_KNOWN_NAT64_PREFIX;
 pub use domain::{
     Action, CertCacheConfig, CpuPlacement, DEFAULT_METRICS_SAMPLE_INTERVAL_MS,
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
