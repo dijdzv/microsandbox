@@ -195,6 +195,15 @@ impl TlsProxy {
                 dst = %guest_dst,
                 "TLS egress denied by domain policy",
             );
+            shared.emit_policy_deny(
+                "tcp",
+                &sni_name,
+                Some(guest_dst.ip()),
+                guest_dst.port(),
+                "sni",
+                "tenant",
+                "domain_policy",
+            );
             // Bypassed names cannot be answered in-tunnel (the guest expects
             // the real server's certificate); they still get a plain close.
             if !tls_state.should_bypass(&sni_name) {
@@ -230,6 +239,15 @@ impl TlsProxy {
                 sni = %sni_name,
                 dst = %guest_dst,
                 "TLS bypass denied by strict hostname policy",
+            );
+            shared.emit_policy_deny(
+                "tcp",
+                &sni_name,
+                Some(guest_dst.ip()),
+                guest_dst.port(),
+                "sni",
+                "tenant",
+                "strict_hostname_policy",
             );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
@@ -732,6 +750,125 @@ async fn flush_to_guest(
 mod tests {
     use super::*;
     use crate::secrets::{config::SecretsConfig, handle::SecretsHandle};
+    use std::fs::OpenOptions;
+    use std::sync::Mutex;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[tokio::test]
+    async fn tls_policy_denials_emit_without_dialing_upstream() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for strict_bypass in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dst = listener.local_addr().unwrap();
+            let shared = Arc::new(SharedState::new(16));
+            shared.set_sandbox_id(Arc::<str>::from("tls-deny"));
+            shared.cache_resolved_hostname(
+                "blocked.example",
+                crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
+                [dst.ip()],
+                std::time::Duration::from_secs(60),
+            );
+            let policy = if strict_bypass {
+                NetworkPolicy {
+                    default_egress: crate::policy::Action::Deny,
+                    default_ingress: crate::policy::Action::Allow,
+                    rules: vec![crate::policy::Rule::allow_egress(
+                        crate::policy::Destination::Domain("blocked.example".parse().unwrap()),
+                    )],
+                }
+            } else {
+                NetworkPolicy::none()
+            };
+            let state = Arc::new(
+                TlsState::new(
+                    microsandbox_types::TlsConfig {
+                        bypass: if strict_bypass {
+                            vec!["blocked.example".parse().unwrap()]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    SecretsHandle::new(SecretsConfig::default()),
+                )
+                .unwrap(),
+            );
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from("blocked.example").unwrap(),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let (from_tx, from_rx) = mpsc::channel(4);
+            from_tx.send(Bytes::from(hello)).await.unwrap();
+            drop(from_tx);
+            let (to_tx, mut to_rx) = mpsc::channel(4);
+            let status = Arc::new(ProxyConnectState::new());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("deny.jsonl");
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(Mutex::new(file))
+                .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+            let guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+            TlsProxy::new(
+                dst,
+                UpstreamTcpTarget::direct(dst),
+                from_rx,
+                to_tx,
+                shared,
+                state,
+                Arc::new(policy),
+                strict_bypass,
+                status.clone(),
+                None,
+            )
+            .try_run()
+            .await
+            .unwrap();
+            drop(guard);
+            assert_eq!(
+                status.status(),
+                crate::tcp::connection::ProxyConnectStatus::PolicyDenied
+            );
+            assert!(to_rx.recv().await.is_none());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+            let body = std::fs::read_to_string(&path).unwrap();
+            let rows: Vec<serde_json::Value> = body
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["fields"]["sandbox_id"], "tls-deny");
+            assert_eq!(rows[0]["fields"]["host"], "blocked.example");
+            assert_eq!(rows[0]["fields"]["source"], "sni");
+            assert_eq!(rows[0]["fields"]["policy_origin"], "tenant");
+            assert_eq!(
+                rows[0]["fields"]["reason"],
+                if strict_bypass {
+                    "strict_hostname_policy"
+                } else {
+                    "domain_policy"
+                }
+            );
+        }
+    }
 
     async fn tls_denial_response(chunks: &[&[u8]], close_input: bool, enabled: bool) -> Vec<u8> {
         let state = TlsState::new(

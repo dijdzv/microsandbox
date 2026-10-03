@@ -252,6 +252,15 @@ impl TcpProxy {
                             dst = %guest_dst,
                             "TCP egress denied by strict hostname policy",
                         );
+                        shared.emit_policy_deny(
+                            "tcp",
+                            sni.as_deref().unwrap_or(""),
+                            Some(guest_dst.ip()),
+                            guest_dst.port(),
+                            "sni",
+                            "tenant",
+                            "strict_hostname_policy",
+                        );
                         proxy_connect.mark_policy_denied();
                         shared.proxy_wake.wake();
                         return Ok(());
@@ -262,6 +271,15 @@ impl TcpProxy {
                         dst = %guest_dst,
                         source = source.label(),
                         "TCP egress denied by domain policy",
+                    );
+                    shared.emit_policy_deny(
+                        "tcp",
+                        sni.as_deref().unwrap_or(""),
+                        Some(guest_dst.ip()),
+                        guest_dst.port(),
+                        source.label(),
+                        "tenant",
+                        "domain_policy",
                     );
                     if shared.http_deny_response_enabled() {
                         initial_buf = peek_for_http_request(
@@ -677,6 +695,15 @@ async fn handle_connect_tunnel(
                 sni = %expected_sni,
                 dst = %tunnel_dst,
                 "CONNECT tunnel denied by strict hostname policy",
+            );
+            shared.emit_policy_deny(
+                "tcp",
+                expected_sni,
+                Some(tunnel_dst.ip()),
+                tunnel_dst.port(),
+                "connect",
+                "tenant",
+                "strict_hostname_policy",
             );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
@@ -1310,6 +1337,12 @@ pub(crate) async fn peek_for_sni(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::sync::Mutex;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// Synthetic TLS ClientHello carrying SNI `example.com`. Bytes
     /// borrowed from `tls::sni` test fixtures so the parser sees a
@@ -1640,6 +1673,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let dst = listener.local_addr().unwrap();
             let shared = Arc::new(shared_with("blocked.example", "127.0.0.1"));
+            shared.set_sandbox_id(Arc::<str>::from("http-deny"));
             shared.set_http_config(microsandbox_types::HttpConfig {
                 deny_response: enabled,
                 deny_message: Some("blocked {host}".into()),
@@ -1662,6 +1696,19 @@ mod tests {
                 .await
                 .unwrap();
             drop(from_tx);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("deny.jsonl");
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(Mutex::new(file))
+                .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+            let guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
             TcpProxy::new(
                 dst,
                 UpstreamTcpTarget::direct(dst),
@@ -1678,6 +1725,20 @@ mod tests {
             .try_run()
             .await
             .unwrap();
+            drop(guard);
+            let body = std::fs::read_to_string(&path).unwrap();
+            let rows: Vec<serde_json::Value> = body
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "HTTP opt-in must not suppress or duplicate a deny event"
+            );
+            assert_eq!(rows[0]["fields"]["sandbox_id"], "http-deny");
+            assert_eq!(rows[0]["fields"]["policy_origin"], "tenant");
+            assert_eq!(rows[0]["fields"]["reason"], "domain_policy");
             let response = to_rx.recv().await;
             if enabled {
                 let response = response.unwrap();
@@ -2479,6 +2540,7 @@ mod tests {
     async fn strict_mode_blocks_hostname_allowed_opaque_tls() {
         let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
         let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        shared.set_sandbox_id(Arc::<str>::from("strict-tcp"));
         let policy = Arc::new(NetworkPolicy {
             default_egress: Action::Deny,
             default_ingress: Action::Allow,
@@ -2494,6 +2556,18 @@ mod tests {
             .unwrap();
         drop(from_tx);
 
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_filter(Targets::new().with_target("policy_deny", tracing::Level::TRACE));
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
         TcpProxy::new(
             dst,
             UpstreamTcpTarget::direct(dst),
@@ -2510,8 +2584,21 @@ mod tests {
         .try_run()
         .await
         .unwrap();
+        drop(guard);
 
         assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        let mut body = String::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(row["fields"]["sandbox_id"], "strict-tcp");
+        assert_eq!(row["fields"]["host"], "allowed.example");
+        assert_eq!(row["fields"]["policy_origin"], "tenant");
+        assert_eq!(row["fields"]["reason"], "strict_hostname_policy");
     }
 
     #[tokio::test]

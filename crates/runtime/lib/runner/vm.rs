@@ -2540,6 +2540,7 @@ fn build_vm(
         let mut network =
             SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot, vm.deployment_profile)
                 .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
+        network.set_sandbox_id(Arc::<str>::from(config.sandbox_id.to_string()));
         if let Some(restore) = &vm.checkpoint_restore {
             let gateway = restore.network_gateway_mac.ok_or_else(|| {
                 RuntimeError::Custom(
