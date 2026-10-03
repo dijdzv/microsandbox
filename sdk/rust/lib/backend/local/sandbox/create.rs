@@ -1048,13 +1048,27 @@ impl LocalBackend {
             .exec(write_db)
             .await?;
         if created_named_volumes.is_empty() {
-            let _ = Self::compare_and_set_sandbox_status(
-                write_db,
-                sandbox_id,
-                &[SandboxStatus::Starting, SandboxStatus::Running],
-                SandboxStatus::Stopped,
-            )
-            .await;
+            // The runtime guard above proves this process has exited. Release its
+            // address slot in the same write that marks the row stopped; a failed
+            // start must not reserve that slot until pool exhaustion.
+            let update = sandbox_entity::Entity::update_many()
+                .col_expr(
+                    sandbox_entity::Column::Status,
+                    Expr::value(SandboxStatus::Stopped),
+                )
+                .col_expr(
+                    sandbox_entity::Column::UpdatedAt,
+                    Expr::value(chrono::Utc::now().naive_utc()),
+                )
+                .filter(sandbox_entity::Column::Id.eq(sandbox_id))
+                .filter(
+                    sandbox_entity::Column::Status
+                        .is_in([SandboxStatus::Starting, SandboxStatus::Running]),
+                );
+            microsandbox_db::catalog::clear_runtime_fields(write_db, update)
+                .await?
+                .exec(write_db)
+                .await?;
         } else {
             rollback_created_named_volumes(self, created_named_volumes).await;
             let _ = Self::delete_sandbox_record(write_db, sandbox_id).await;
@@ -2241,7 +2255,7 @@ mod tests {
     use microsandbox_db::entity::{run as run_entity, sandbox_rootfs as sandbox_rootfs_entity};
     use microsandbox_db::pool::DbPools;
     use microsandbox_migration::{Migrator, MigratorTrait};
-    use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+    use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, sea_query::Expr};
     use tempfile::tempdir;
 
     #[cfg(unix)]
@@ -2570,6 +2584,12 @@ mod tests {
         LocalBackend::update_sandbox_status(write_db, sandbox_id, status)
             .await
             .unwrap();
+        sandbox_entity::Entity::update_many()
+            .col_expr(sandbox_entity::Column::NetworkSlot, Expr::value(1_u16))
+            .filter(sandbox_entity::Column::Id.eq(sandbox_id))
+            .exec(write_db)
+            .await
+            .unwrap();
         let active_run = run_entity::Entity::insert(run_entity::ActiveModel {
             sandbox_id: Set(sandbox_id),
             status: Set(run_entity::RunStatus::Running),
@@ -2585,6 +2605,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(sandbox_before.network_slot, Some(1));
         let run_before = run_entity::Entity::find_by_id(active_run)
             .one(write_db)
             .await
@@ -2703,6 +2724,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(sandbox.status, SandboxStatus::Stopped);
+            assert_eq!(sandbox.network_slot, None);
             let run = run_entity::Entity::find_by_id(active_run)
                 .one(write_db)
                 .await
