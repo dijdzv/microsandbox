@@ -177,6 +177,17 @@ impl TlsProxy {
                 dst = %connect_dst,
                 "TLS SNI did not match CONNECT authority",
             );
+            // This is a proxy-owned identity invariant, not a tenant allowlist
+            // miss. Record it before closing, through the existing deny sink.
+            shared.emit_policy_deny(
+                "tcp",
+                &sni_name,
+                Some(guest_dst.ip()),
+                guest_dst.port(),
+                "sni",
+                "platform",
+                "connect_sni_mismatch",
+            );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
             return Ok(());
@@ -503,7 +514,8 @@ pub(crate) async fn intercept_relay(
     } else {
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
-    .with_guest_dst(guest_dst);
+    .with_guest_dst(guest_dst)
+    .with_authority_deny_recorder(shared.clone(), guest_dst);
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -759,7 +771,12 @@ mod tests {
     #[tokio::test]
     async fn tls_policy_denials_emit_without_dialing_upstream() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        for strict_bypass in [false, true] {
+        for (strict_bypass, expected_sni) in [
+            (false, None),
+            (true, None),
+            (false, Some("permitted.example")),
+            (false, Some("BLOCKED.EXAMPLE.")),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let dst = listener.local_addr().unwrap();
             let shared = Arc::new(SharedState::new(16));
@@ -835,6 +852,7 @@ mod tests {
                 status.clone(),
                 None,
             )
+            .with_expected_sni(expected_sni.map(str::to_string))
             .try_run()
             .await
             .unwrap();
@@ -858,10 +876,20 @@ mod tests {
             assert_eq!(rows[0]["fields"]["sandbox_id"], "tls-deny");
             assert_eq!(rows[0]["fields"]["host"], "blocked.example");
             assert_eq!(rows[0]["fields"]["source"], "sni");
-            assert_eq!(rows[0]["fields"]["policy_origin"], "tenant");
+            let connect_mismatch = expected_sni == Some("permitted.example");
+            assert_eq!(
+                rows[0]["fields"]["policy_origin"],
+                if connect_mismatch {
+                    "platform"
+                } else {
+                    "tenant"
+                }
+            );
             assert_eq!(
                 rows[0]["fields"]["reason"],
-                if strict_bypass {
+                if connect_mismatch {
+                    "connect_sni_mismatch"
+                } else if strict_bypass {
                     "strict_hostname_policy"
                 } else {
                     "domain_policy"

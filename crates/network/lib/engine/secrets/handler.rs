@@ -205,7 +205,10 @@ struct SecretHostIdentity<'a> {
 #[derive(Clone)]
 enum HttpAuthorityValidator {
     /// Require every HTTP authority-bearing field to match this TLS SNI.
-    Sni(String),
+    Sni {
+        hostname: String,
+        recorder: Option<AuthorityDenyRecorder>,
+    },
     /// Require every HTTP authority-bearing field to be allowed by egress policy.
     Policy {
         guest_dst: SocketAddr,
@@ -215,6 +218,13 @@ enum HttpAuthorityValidator {
         /// proven host identity even when network policy also permits another host.
         secret_host: Option<String>,
     },
+}
+
+/// Host-owned context for the existing retained policy-deny sink.
+#[derive(Clone)]
+struct AuthorityDenyRecorder {
+    shared: Arc<SharedState>,
+    guest_dst: SocketAddr,
 }
 
 /// Parsed HTTP/1 request metadata needed for validation and framing.
@@ -529,7 +539,10 @@ impl SecretsHandler {
             sni,
             true,
             Some(SecretHostIdentity { guest_ip, shared }),
-            Some(HttpAuthorityValidator::Sni(sni.to_string())),
+            Some(HttpAuthorityValidator::Sni {
+                hostname: sni.to_string(),
+                recorder: None,
+            }),
             false,
         )
     }
@@ -544,7 +557,10 @@ impl SecretsHandler {
             sni,
             true,
             None,
-            Some(HttpAuthorityValidator::Sni(sni.to_string())),
+            Some(HttpAuthorityValidator::Sni {
+                hostname: sni.to_string(),
+                recorder: None,
+            }),
             false,
         )
     }
@@ -564,7 +580,10 @@ impl SecretsHandler {
             host,
             false,
             Some(SecretHostIdentity { guest_ip, shared }),
-            Some(HttpAuthorityValidator::Sni(host.to_string())),
+            Some(HttpAuthorityValidator::Sni {
+                hostname: host.to_string(),
+                recorder: None,
+            }),
             false,
         )
     }
@@ -726,6 +745,18 @@ impl SecretsHandler {
     /// Attach the original guest destination for structured violation logs.
     pub fn with_guest_dst(mut self, guest_dst: SocketAddr) -> Self {
         self.guest_dst = Some(guest_dst);
+        self
+    }
+
+    /// Attach the retained deny sink without changing public constructors.
+    pub(crate) fn with_authority_deny_recorder(
+        mut self,
+        shared: Arc<SharedState>,
+        guest_dst: SocketAddr,
+    ) -> Self {
+        if let Some(HttpAuthorityValidator::Sni { recorder, .. }) = self.http_authority.as_mut() {
+            *recorder = Some(AuthorityDenyRecorder { shared, guest_dst });
+        }
         self
     }
 
@@ -2211,12 +2242,11 @@ fn validate_http1_authority(
         return Err(SecretViolationAction::Block);
     }
 
-    for authority in metadata
-        .host_headers
-        .iter()
-        .chain(metadata.target_authority.iter())
-    {
-        validate_authority(authority, validator)?;
+    for authority in &metadata.host_headers {
+        validate_authority(authority, validator, "http_host")?;
+    }
+    if let Some(authority) = &metadata.target_authority {
+        validate_authority(authority, validator, "http_authority")?;
     }
 
     Ok(())
@@ -2233,10 +2263,10 @@ fn validate_http2_authority(
         if name.eq_ignore_ascii_case(b":authority") {
             authority_count += 1;
             let authority = String::from_utf8_lossy(value);
-            validate_authority(authority.as_ref(), validator)?;
+            validate_authority(authority.as_ref(), validator, "http_authority")?;
         } else if name.eq_ignore_ascii_case(b"host") {
             let host = String::from_utf8_lossy(value);
-            validate_authority(host.as_ref(), validator)?;
+            validate_authority(host.as_ref(), validator, "http_host")?;
         }
     }
 
@@ -2250,11 +2280,23 @@ fn validate_http2_authority(
 fn validate_authority(
     authority: &str,
     validator: &HttpAuthorityValidator,
+    source: &'static str,
 ) -> Result<(), SecretViolationAction> {
     match validator {
-        HttpAuthorityValidator::Sni(sni) => authority_matches_sni(authority, sni)
-            .then_some(())
-            .ok_or(SecretViolationAction::Block),
+        HttpAuthorityValidator::Sni { hostname, .. } => {
+            if authority_matches_sni(authority, hostname) {
+                Ok(())
+            } else {
+                record_authority_deny(
+                    validator,
+                    authority,
+                    source,
+                    "platform",
+                    "http_authority_mismatch",
+                );
+                Err(SecretViolationAction::Block)
+            }
+        }
         HttpAuthorityValidator::Policy {
             guest_dst,
             network_policy,
@@ -2267,9 +2309,23 @@ fn validate_authority(
                 .as_ref()
                 .is_some_and(|host| !authority_matches_sni(authority, host))
             {
+                record_authority_deny(
+                    validator,
+                    authority,
+                    source,
+                    "platform",
+                    "http_authority_mismatch",
+                );
                 return Err(SecretViolationAction::Block);
             }
             let Some(hostname) = authority_hostname(authority) else {
+                record_authority_deny(
+                    validator,
+                    authority,
+                    source,
+                    "platform",
+                    "invalid_http_authority",
+                );
                 return Err(SecretViolationAction::Block);
             };
             let hostname = hostname.to_ascii_lowercase();
@@ -2282,11 +2338,53 @@ fn validate_authority(
             ) {
                 EgressEvaluation::Allow => Ok(()),
                 EgressEvaluation::Deny | EgressEvaluation::DeferUntilHostname => {
+                    record_authority_deny(validator, authority, source, "tenant", "domain_policy");
                     Err(SecretViolationAction::Block)
                 }
             }
         }
     }
+}
+
+/// Never copy raw authority text into retained logs: malformed authority can
+/// contain userinfo, paths, placeholders or control bytes. Enforcement above
+/// deliberately retains its existing parser and decision semantics.
+fn record_authority_deny(
+    validator: &HttpAuthorityValidator,
+    authority: &str,
+    source: &'static str,
+    origin: &'static str,
+    reason: &'static str,
+) {
+    let (shared, guest_dst) = match validator {
+        HttpAuthorityValidator::Sni {
+            recorder: Some(recorder),
+            ..
+        } => (recorder.shared.as_ref(), recorder.guest_dst),
+        HttpAuthorityValidator::Policy {
+            shared, guest_dst, ..
+        } => (shared.as_ref(), *guest_dst),
+        HttpAuthorityValidator::Sni { recorder: None, .. } => return,
+    };
+    let host = authority_hostname(authority)
+        .filter(|host| {
+            host.len() <= 253
+                && (host.parse::<IpAddr>().is_ok()
+                    || host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.'))
+        })
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    shared.emit_policy_deny(
+        "tcp",
+        &host,
+        Some(guest_dst.ip()),
+        guest_dst.port(),
+        source,
+        origin,
+        reason,
+    );
 }
 
 fn http2_header_detection_bytes(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
@@ -5811,6 +5909,159 @@ mod tests {
                 .unwrap()
                 .contains("real-secret")
         );
+    }
+
+    #[test]
+    fn inspected_authority_denials_emit_without_exposing_request_or_secrets() {
+        use tracing_subscriber::{Layer, filter::Targets, layer::SubscriberExt};
+
+        for mode in ["tls", "connect", "http_policy", "http_secret"] {
+            for http2 in [false, true] {
+                for bad_host in ["evil.com", "user:private-test-value@evil.com", ""] {
+                    let ip = Ipv4Addr::new(203, 0, 113, 30);
+                    let dst = SocketAddr::new(IpAddr::V4(ip), 443);
+                    let shared = Arc::new(SharedState::new(16));
+                    shared.set_sandbox_id(Arc::<str>::from("authority-deny"));
+                    cache_host(&shared, "api.openai.com", ip);
+                    let mut config = if mode == "http_policy" {
+                        SecretsConfig::default()
+                    } else {
+                        make_config(vec![make_secret(
+                            "$KEY",
+                            "private-test-value",
+                            "api.openai.com",
+                        )])
+                    };
+                    if mode == "http_secret" {
+                        config.secrets[0].require_tls_identity = false;
+                    }
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("deny.jsonl");
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    let layer = tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(std::sync::Mutex::new(file))
+                        .with_filter(
+                            Targets::new().with_target("policy_deny", tracing::Level::TRACE),
+                        );
+                    let guard = tracing::subscriber::set_default(
+                        tracing_subscriber::registry().with(layer),
+                    );
+                    let mut handler = match mode {
+                        "connect" => SecretsHandler::new_tls_intercepted_via_connect(
+                            &config,
+                            "api.openai.com",
+                        ),
+                        "tls" => SecretsHandler::new_tls_intercepted(
+                            &config,
+                            "api.openai.com",
+                            dst.ip(),
+                            &shared,
+                        ),
+                        _ => SecretsHandler::new_plain_http_policy(
+                            &config,
+                            "api.openai.com",
+                            dst,
+                            Arc::new(if mode == "http_policy" {
+                                NetworkPolicy {
+                                    default_egress: crate::policy::Action::Deny,
+                                    default_ingress: crate::policy::Action::Allow,
+                                    rules: vec![crate::policy::Rule::allow_egress(
+                                        crate::policy::Destination::Domain(
+                                            "api.openai.com".parse().unwrap(),
+                                        ),
+                                    )],
+                                }
+                            } else {
+                                NetworkPolicy::allow_all()
+                            }),
+                            shared.clone(),
+                        ),
+                    }
+                    .with_authority_deny_recorder(shared.clone(), dst);
+
+                    // A valid request never emits a denial. The next request is
+                    // rejected before either the placeholder or plaintext can leave.
+                    for (stream, host, allowed) in
+                        [(1, "api.openai.com", true), (3, bad_host, false)]
+                    {
+                        let request = if http2 {
+                            let encoded = encode_h2_header_block(&[
+                                (b":method", b"GET"),
+                                (b":scheme", b"https"),
+                                (b":authority", host.as_bytes()),
+                                (b":path", b"/private-path"),
+                                (b"authorization", b"Bearer $KEY"),
+                            ]);
+                            let mut request = if stream == 1 {
+                                HTTP2_PREFACE.to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            append_http2_header_frames(&mut request, stream, true, &encoded)
+                                .unwrap();
+                            request
+                        } else {
+                            format!("GET /private-path HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer $KEY\r\n\r\n").into_bytes()
+                        };
+                        let result = handler.substitute(&request);
+                        if allowed {
+                            assert!(result.is_ok());
+                        } else {
+                            assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+                        }
+                    }
+                    drop(guard);
+                    let body = std::fs::read_to_string(&path).unwrap();
+                    assert!(!body.contains("private-test-value"));
+                    assert!(!body.contains("$KEY"));
+                    assert!(!body.contains("private-path"));
+                    assert!(!body.contains("authorization"));
+                    let rows: Vec<serde_json::Value> = body
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0]["fields"]["sandbox_id"], "authority-deny");
+                    assert_eq!(
+                        rows[0]["fields"]["host"],
+                        if bad_host == "evil.com" {
+                            "evil.com"
+                        } else {
+                            ""
+                        }
+                    );
+                    assert_eq!(rows[0]["fields"]["ip"], "203.0.113.30");
+                    assert_eq!(rows[0]["fields"]["port"], 443);
+                    assert_eq!(
+                        rows[0]["fields"]["source"],
+                        if http2 { "http_authority" } else { "http_host" }
+                    );
+                    assert_eq!(
+                        rows[0]["fields"]["policy_origin"],
+                        if mode == "http_policy" && !bad_host.is_empty() {
+                            "tenant"
+                        } else {
+                            "platform"
+                        }
+                    );
+                    assert_eq!(
+                        rows[0]["fields"]["reason"],
+                        if mode == "http_policy" && bad_host.is_empty() {
+                            "invalid_http_authority"
+                        } else if mode == "http_policy" {
+                            "domain_policy"
+                        } else {
+                            "http_authority_mismatch"
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]
