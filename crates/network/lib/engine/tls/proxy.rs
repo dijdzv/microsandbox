@@ -179,9 +179,16 @@ impl TlsProxy {
             );
             // This is a proxy-owned identity invariant, not a tenant allowlist
             // miss. Record it before closing, through the existing deny sink.
+            // ClientHello parsing accepts arbitrary UTF-8; retain a hostname,
+            // never path/userinfo/control text supplied as a malformed SNI.
+            let event_host = if ServerName::try_from(sni_name.as_str()).is_ok() {
+                sni_name.as_str()
+            } else {
+                ""
+            };
             shared.emit_policy_deny(
                 "tcp",
-                &sni_name,
+                event_host,
                 Some(guest_dst.ip()),
                 guest_dst.port(),
                 "sni",
@@ -771,11 +778,14 @@ mod tests {
     #[tokio::test]
     async fn tls_policy_denials_emit_without_dialing_upstream() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        for (strict_bypass, expected_sni) in [
-            (false, None),
-            (true, None),
-            (false, Some("permitted.example")),
-            (false, Some("BLOCKED.EXAMPLE.")),
+        for (strict_bypass, expected_sni, malformed_sni) in [
+            (false, None, None),
+            (true, None, None),
+            (false, Some("permitted.example"), None),
+            (false, Some("BLOCKED.EXAMPLE."), None),
+            (false, Some("permitted.example"), Some("private/secret!")),
+            (false, Some("permitted.example"), Some("user@secret.xxx")),
+            (false, Some("permitted.example"), Some("private\nsecret!")),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let dst = listener.local_addr().unwrap();
@@ -822,6 +832,20 @@ mod tests {
             .unwrap();
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
+            if let Some(malformed) = malformed_sni {
+                // A malicious peer need not use rustls's hostname validation.
+                // Preserve all TLS lengths while replacing only the SNI bytes.
+                let original = b"blocked.example";
+                assert_eq!(malformed.len(), original.len());
+                let offsets: Vec<_> = hello
+                    .windows(original.len())
+                    .enumerate()
+                    .filter_map(|(index, bytes)| (bytes == original).then_some(index))
+                    .collect();
+                assert_eq!(offsets.len(), 1);
+                let offset = offsets[0];
+                hello[offset..offset + original.len()].copy_from_slice(malformed.as_bytes());
+            }
             let (from_tx, from_rx) = mpsc::channel(4);
             from_tx.send(Bytes::from(hello)).await.unwrap();
             drop(from_tx);
@@ -874,7 +898,19 @@ mod tests {
                 .collect();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0]["fields"]["sandbox_id"], "tls-deny");
-            assert_eq!(rows[0]["fields"]["host"], "blocked.example");
+            assert_eq!(
+                rows[0]["fields"]["host"],
+                if malformed_sni.is_some() {
+                    ""
+                } else {
+                    "blocked.example"
+                }
+            );
+            if let Some(malformed) = malformed_sni {
+                assert!(!body.contains(malformed));
+            }
+            assert_eq!(rows[0]["fields"]["ip"], dst.ip().to_string());
+            assert_eq!(rows[0]["fields"]["port"], dst.port());
             assert_eq!(rows[0]["fields"]["source"], "sni");
             let connect_mismatch = expected_sni == Some("permitted.example");
             assert_eq!(
