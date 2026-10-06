@@ -17,6 +17,13 @@ const execute = promisify(execFile);
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 const managed = '/etc/microsandbox/managed.json';
 
+export function fixtureFailureLabel(report) {
+  if (report?.qualified !== false || typeof report.failure !== 'string')
+    return 'namespace_fixture_failed';
+  return /^(?:COMMAND_FAILED_(?:version|ca|leaf-request|leaf|mount|create|guest|stop|remove|unmount)|fixture_assertion|cleanup_failed|unmount_failed|qualification_failed)$/.test(report.failure)
+    ? report.failure : 'namespace_fixture_failed';
+}
+
 export function validateIsolation(e) {
   assert.equal(e.pid, 1, 'fixture must own a private PID namespace');
   for (const [current, parent, prefix] of [[e.net, e.parentNet, 'net'], [e.mount, e.parentMount, 'mnt']]) {
@@ -38,6 +45,12 @@ export function validateIsolation(e) {
     assert(!route.gateway && !route.via && !route.nexthops, 'no gateway');
     assert(route.dst && !['default', '0.0.0.0/0', '::/0'].includes(route.dst), 'no default route');
   }
+  // The runtime selects guest IPv4 only if its UDP route lookup to
+  // TEST-NET-1 succeeds. This loopback-only route enables that lookup without
+  // a default route or access to any external network device.
+  assert(e.routes.some(route => ['192.0.2.1', '192.0.2.1/32'].includes(route.dst)
+    && route.dev === 'lo' && (!route.type || route.type === 'unicast')),
+  'fixture needs the local IPv4 family-detection route');
 }
 
 export function validateEvidence(e) {
@@ -109,6 +122,7 @@ async function runInside(root, parentNet, parentMount, args) {
   // All network mutations occur inside this new namespace, never on the host.
   await execute('/usr/sbin/ip', ['link', 'set', 'lo', 'up']);
   await execute('/usr/sbin/ip', ['addr', 'add', '8.8.8.8/32', 'dev', 'lo']);
+  await execute('/usr/sbin/ip', ['route', 'add', '192.0.2.1/32', 'dev', 'lo']);
   const isolationBefore = await observeIsolation(parentNet, parentMount);
   validateIsolation(isolationBefore);
   const [binary, lower, firmware, fuse] = args;
@@ -304,7 +318,11 @@ async function main(args) {
       timeout: 180000, maxBuffer: 1024 * 1024});
     process.stdout.write(result.stdout);
   } catch {
-    console.log(JSON.stringify({result: `${root}/result.json`, qualified: false, failure: 'namespace_fixture_failed'}));
+    let failure = 'namespace_fixture_failed';
+    // A completed, unsuccessful child is not necessarily an unshare failure.
+    // Publish only its fixed reason label, never stderr or arbitrary text.
+    try {failure = fixtureFailureLabel(JSON.parse(readFileSync(`${root}/result.json`, 'utf8')));} catch {}
+    console.log(JSON.stringify({result: `${root}/result.json`, qualified: false, failure}));
     process.exitCode = 1;
   }
 }

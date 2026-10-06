@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {validateIsolation, validateEvidence} from './orbit-tls-policy-namespace.mjs';
+import {validateIsolation, validateEvidence, fixtureFailureLabel} from './orbit-tls-policy-namespace.mjs';
 
 const isolation = () => ({
   pid: 1, net: 'net:[2]', parentNet: 'net:[1]',
@@ -10,7 +10,8 @@ const isolation = () => ({
     {local: '127.0.0.1', prefixlen: 8}, {local: '8.8.8.8', prefixlen: 32},
     {local: '::1', prefixlen: 128},
   ]}],
-  routes: [{type: 'local', dst: '8.8.8.8', dev: 'lo'}],
+  routes: [{type: 'local', dst: '8.8.8.8', dev: 'lo'},
+    {dst: '192.0.2.1', dev: 'lo', scope: 'link'}],
 });
 const evidence = () => ({
   isolationBefore: isolation(), isolationAfter: isolation(),
@@ -36,6 +37,19 @@ test('accepts a private namespace with only logical loopback fixture addresses',
 test('refuses the host namespaces and a non-init process', () => {
   for (const patch of [{net: 'net:[1]'}, {mount: 'mnt:[3]'}, {pid: 2}])
     assert.throws(() => validateIsolation({...isolation(), ...patch}));
+});
+test('requires the local IPv4 family-detection route without an external gateway', () => {
+  const missing = isolation();
+  missing.routes = missing.routes.filter(route => route.dst !== '192.0.2.1');
+  assert.throws(() => validateIsolation(missing));
+  const explicitPrefix = isolation();
+  explicitPrefix.routes[1].dst = '192.0.2.1/32';
+  validateIsolation(explicitPrefix);
+  for (const patch of [{dev: 'eth0'}, {gateway: '10.0.0.1'}, {dst: '192.0.2.0/24'}]) {
+    const wrong = isolation();
+    wrong.routes[1] = {...wrong.routes[1], ...patch};
+    assert.throws(() => validateIsolation(wrong));
+  }
 });
 test('refuses external interfaces, addresses, gateways and default routes', () => {
   for (const patch of [
@@ -65,4 +79,14 @@ test('requires verified TLS, positive control, unchanged isolation and complete 
   }
   const escaped = evidence(); escaped.isolationAfter.links.push({ifname: 'eth0', flags: ['UP']});
   assert.throws(() => validateEvidence(escaped));
+});
+test('preserves a known child failure label without publishing raw errors or claiming success', () => {
+  assert.equal(fixtureFailureLabel({qualified: false, failure: 'COMMAND_FAILED_guest',
+    stderr: 'fixture-private-marker'}), 'COMMAND_FAILED_guest');
+  assert.equal(fixtureFailureLabel({qualified: false, failure: 'fixture_assertion'}), 'fixture_assertion');
+  for (const report of [null, {}, {qualified: true, failure: null},
+    {qualified: true, failure: 'COMMAND_FAILED_guest'},
+    {qualified: false, failure: 'fixture-private-marker'},
+    {qualified: false, failure: 'COMMAND_FAILED_guest\nfixture-private-marker'}])
+    assert.equal(fixtureFailureLabel(report), 'namespace_fixture_failed');
 });
