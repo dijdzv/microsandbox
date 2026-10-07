@@ -42,7 +42,14 @@ async fn live_framed_client_and_native_raw_paths() {
         .await
         .unwrap();
     assert_eq!(message.t, "control.capabilities.result");
-    let envelope = Envelope::new(1, "control.cpu.state", &Empty {}).unwrap();
+    // Raw application frames use the negotiated generation, not the stable
+    // generation-one handshake. A current runtime correctly rejects a mismatch.
+    let envelope = Envelope::new(
+        client.ready().welcome.generation,
+        "control.cpu.state",
+        &Empty {},
+    )
+    .unwrap();
     let response = client
         .request_raw(0, envelope.encode().unwrap())
         .await
