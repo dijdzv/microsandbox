@@ -138,6 +138,31 @@ Skipping verification is similar to using `curl -k`. Use it only for hosts you c
 - microsandbox does not proxy guest client certificates. Bypass hosts that require guest mTLS.
 - microsandbox does not intercept QUIC and HTTP/3 traffic.
 
+## Retained denial events in the Orbit fork
+
+The Orbit fork routes identity-validation denials through its existing
+`policy_deny` JSONL recorder. This does not relax TLS verification, change
+secret substitution, or add a second log stream.
+
+- A CONNECT authority that disagrees with ClientHello SNI emits
+  `source: sni`, `policy_origin: platform`, `reason: connect_sni_mismatch`.
+- Intercepted HTTP/1 Host or HTTP/2 authority that disagrees with the
+  connection's verified identity emits `http_host` or `http_authority`,
+  `policy_origin: platform`, `reason: http_authority_mismatch`.
+- Plain-HTTP authority rejected by the tenant's egress policy emits
+  `policy_origin: tenant`, `reason: domain_policy`. An empty authority emits
+  `policy_origin: platform`, `reason: invalid_http_authority`.
+
+Identity failures are not tenant allowlist misses; adding the destination to
+that allowlist cannot bypass them. Events retain only destination metadata
+and a fixed reason, not request paths, headers, bodies, or secret values.
+Malformed authority text containing userinfo or non-host characters is
+recorded with an empty host rather than copied verbatim. Malformed
+ClientHello SNI in CONNECT identity mismatches is also recorded with an
+empty host; rejection and destination metadata are unchanged. Public standalone
+`SecretsHandler` constructors keep their existing signatures; the internal
+TLS relay attaches the recorder context.
+
 ## Trusting host CAs
 
 Corporate proxies often replace server certificates with certificates signed by a company CA. The host trusts that CA, but a sandbox normally does not. Commands such as `apk update`, `pip install`, and `curl` can then fail with a certificate error.
